@@ -1,0 +1,119 @@
+(load "../llvm.carp")
+(load "Test.carp")
+
+(LLVM.setup)
+
+(use Test)
+(use LLVM)
+
+; Exercise the "lower a real frontend" tier: struct types, casts, GEP,
+; loads/stores, a switch over a global, then JIT the result AND emit a native
+; object file for the host target.
+;
+;   i32 struct_add(i64 a, i64 b) {          // trunc + struct + gep + load/store
+;     struct { i32 x; i32 y; } p;
+;     p.x = (i32)a; p.y = (i32)b;
+;     return p.x + p.y;
+;   }
+;   i32 classify(i32 x) {                    // switch + global load
+;     switch (x) { case 0: return 10; case 1: return 20; default: return x + magic; }
+;   }
+;   const i32 magic = 7;
+
+(deftype Result [emit String jit-add Int jit-c0 Int jit-c1 Int jit-def Int])
+
+(defn cstr [s] (String.cstr s))
+
+(defn build-struct-add [ctx builder mod]
+  (let-do [pair (struct-type ctx &[(int32-type ctx) (int32-type ctx)] false)
+           params [(int64-type ctx) (int64-type ctx)]
+           fnty (function-type (int32-type ctx) &params false)
+           func (add-function mod (cstr &@"struct_add") fnty)
+           entry (append-block ctx func (cstr &@"entry"))]
+    (position-at-end builder entry)
+    (let-do [slot (build-alloca builder pair (cstr &@"p"))
+             tx (build-trunc builder (get-param func 0) (int32-type ctx) (cstr &@"tx"))
+             ty (build-trunc builder (get-param func 1) (int32-type ctx) (cstr &@"ty"))
+             gx (build-struct-gep builder pair slot 0 (cstr &@"gx"))
+             gy (build-struct-gep builder pair slot 1 (cstr &@"gy"))]
+      (ignore (build-store builder tx gx))
+      (ignore (build-store builder ty gy))
+      (let-do [lx (build-load builder (int32-type ctx) gx (cstr &@"lx"))
+               ly (build-load builder (int32-type ctx) gy (cstr &@"ly"))]
+        (ignore (build-ret builder (build-add builder lx ly (cstr &@"s"))))))))
+
+(defn build-classify [ctx builder mod magic]
+  (let-do [params [(int32-type ctx)]
+           fnty (function-type (int32-type ctx) &params false)
+           func (add-function mod (cstr &@"classify") fnty)
+           entry (append-block ctx func (cstr &@"entry"))
+           bb0 (append-block ctx func (cstr &@"c0"))
+           bb1 (append-block ctx func (cstr &@"c1"))
+           dflt (append-block ctx func (cstr &@"default"))]
+    (position-at-end builder entry)
+    (let-do [sw (build-switch builder (get-param func 0) dflt 2)]
+      (add-case sw (const-int (int32-type ctx) 0l 0) bb0)
+      (add-case sw (const-int (int32-type ctx) 1l 0) bb1))
+    (position-at-end builder bb0)
+    (ignore (build-ret builder (const-int (int32-type ctx) 10l 0)))
+    (position-at-end builder bb1)
+    (ignore (build-ret builder (const-int (int32-type ctx) 20l 0)))
+    (position-at-end builder dflt)
+    (let-do [m (build-load builder (int32-type ctx) magic (cstr &@"m"))]
+      (ignore (build-ret builder (build-add builder (get-param func 0) m (cstr &@"r")))))))
+
+(defn lower []
+  (let-do [ctx (context-create)
+           builder (builder-create ctx)
+           mod (module-create (cstr &@"frontend") ctx)
+           magic (add-global mod (int32-type ctx) (cstr &@"magic"))]
+    (set-initializer magic (const-int (int32-type ctx) 7l 0))
+    (set-global-constant magic 1)
+    (build-struct-add ctx builder mod)
+    (build-classify ctx builder mod magic)
+    (IO.println &(print-module mod))
+    (let-do [verdict (verify-module mod)]
+      (unless (String.empty? &verdict)
+        (IO.println &(fmt "VERIFY FAILED: %s" &verdict)))
+
+      ; --- AOT: emit a native object file for the host ---
+      (ignore (initialize-native-target))
+      (ignore (initialize-native-asm-printer))
+      (let-do [triple (default-target-triple)
+               target (target-from-triple (cstr &triple))
+               emit-err (if (target-null? target)
+                          @"no target for host triple"
+                          (let [tm (create-target-machine target (cstr &triple)
+                                     (cstr &@"") (cstr &@"")
+                                     codegen-level-default reloc-pic codemodel-default)]
+                            (let-do [e (emit-to-file tm mod (cstr &@"out/frontend.o") filetype-object)]
+                              (dispose-target-machine tm)
+                              e)))]
+        ; --- JIT the same module and call each function ---
+        (link-in-mcjit)
+        (let-do [engine (create-execution-engine mod)
+                 add-addr (function-address engine (cstr &@"struct_add"))
+                 cls-addr (function-address engine (cstr &@"classify"))
+                 res (Result.init emit-err
+                       (call-i32-i32-i32 add-addr 20 22)
+                       (call-i32-i32 cls-addr 0)
+                       (call-i32-i32 cls-addr 1)
+                       (call-i32-i32 cls-addr 5))]
+          (engine-dispose engine)
+          (builder-dispose builder)
+          (context-dispose ctx)
+          res)))))
+
+(def result (lower))
+
+(deftest test
+  (assert-true test (String.empty? (Result.emit &result))
+    "emit-to-file wrote a native object with no error")
+  (assert-equal test 42 @(Result.jit-add &result)
+    "struct_add(20, 22) == 42  (trunc + struct + gep + load/store)")
+  (assert-equal test 10 @(Result.jit-c0 &result)
+    "classify(0) == 10  (switch case)")
+  (assert-equal test 20 @(Result.jit-c1 &result)
+    "classify(1) == 20  (switch case)")
+  (assert-equal test 12 @(Result.jit-def &result)
+    "classify(5) == 5 + magic(7) == 12  (switch default + global load)"))

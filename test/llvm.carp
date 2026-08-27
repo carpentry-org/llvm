@@ -1,0 +1,53 @@
+(load "../llvm.carp")
+(load "Test.carp")
+
+(LLVM.setup)
+
+(use Test)
+(use LLVM)
+
+; Build `i32 add(i32 a, i32 b) { return a + b; }` into a fresh module,
+; capturing the textual IR, the verifier verdict, and the JIT result of
+; add(20, 22).
+(deftype Built [ir String verify String jit Int])
+
+(defn build-add-module []
+  (let-do [ctx (context-create)
+           builder (builder-create ctx)
+           mod (module-create (String.cstr &@"demo") ctx)
+           params [(int32-type ctx) (int32-type ctx)]
+           fnty (function-type (int32-type ctx) &params false)
+           func (add-function mod (String.cstr &@"add") fnty)
+           entry (append-block ctx func (String.cstr &@"entry"))]
+    (position-at-end builder entry)
+    (let-do [a (get-param func 0)
+             b (get-param func 1)
+             sum (build-add builder a b (String.cstr &@"sum"))]
+      (ignore (build-ret builder sum))
+      (let-do [ir (print-module mod)
+               verdict (verify-module mod)]
+        ; hand the module to the JIT engine (it takes ownership)
+        (link-in-mcjit)
+        (ignore (initialize-native-target))
+        (ignore (initialize-native-asm-printer))
+        (let-do [engine (create-execution-engine mod)
+                 result (if (engine-null? engine)
+                          -1
+                          (let [addr (function-address engine (String.cstr &@"add"))]
+                            (call-i32-i32-i32 addr 20 22)))]
+          (unless (engine-null? engine) (engine-dispose engine))
+          (builder-dispose builder)
+          ; note: engine-dispose already freed the module it owned
+          (context-dispose ctx)
+          (IO.println &ir)
+          (Built.init ir verdict result))))))
+
+(def built (build-add-module))
+
+(deftest test
+  (assert-true test (String.empty? (Built.verify &built))
+    "generated module passes the verifier")
+  (assert-true test (String.contains-string? (Built.ir &built) &@"define i32 @add")
+    "IR declares the add function")
+  (assert-equal test 42 @(Built.jit &built)
+    "JIT-compiled add(20, 22) returns 42"))

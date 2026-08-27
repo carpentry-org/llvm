@@ -1,0 +1,256 @@
+; mini — a tiny expression language that compiles to native code via LLVM.
+;
+; Grammar (a Lisp-ish prefix syntax, everything is i32):
+;   program := defn*
+;   defn    := '(' 'defn' name '(' name* ')' expr ')'
+;   expr    := int | name | '(' op expr expr ')' | '(' 'if' expr expr expr ')'
+;            | '(' name expr* ')'          ; a call
+;   op      := '+' | '-' | '*' | '/' | '<'
+;
+; The pipeline: source string -> tokens -> AST -> LLVM IR -> {verify, print,
+; optimize-free JIT, native .o}. `if` lowers to blocks + a phi; `<` yields i32
+; 0/1; calls resolve by name, so recursion just works.
+
+(load "../llvm.carp")
+(LLVM.setup)
+(use LLVM)
+
+(defn cstr [s] (String.cstr s))
+
+; ------------------------------------------------------------------ AST + tokens
+
+(deftype Expr
+  (Num  [Int])
+  (Var  [String])
+  (Bin  [Char (Box Expr) (Box Expr)])
+  (If   [(Box Expr) (Box Expr) (Box Expr)])
+  (Call [String (Array (Box Expr))]))
+
+(deftype Func [name String params (Array String) body Expr])
+
+(deftype Token (LParen []) (RParen []) (Int [Int]) (Sym [String]))
+
+; ------------------------------------------------------------------ lexer
+
+(defn sym-char? [c]
+  (and (not (Char.whitespace? c))
+       (and (/= (Char.to-int c) 40) (/= (Char.to-int c) 41))))
+
+(defn digit-val [c] (- (Char.to-int c) (Char.to-int \0)))
+
+(defn tokenize [src]
+  (let-do [toks []
+           i 0
+           n (String.length src)]
+    (while (< i n)
+      (let [c (String.char-at src i)]
+        (cond
+          (Char.whitespace? c) (set! i (inc i))
+          (= (Char.to-int c) 40) (do (set! toks (Array.push-back toks (Token.LParen))) (set! i (inc i)))
+          (= (Char.to-int c) 41) (do (set! toks (Array.push-back toks (Token.RParen))) (set! i (inc i)))
+          (Char.num? c)
+            (let-do [j i v 0]
+              (while (and (< j n) (Char.num? (String.char-at src j)))
+                (do (set! v (+ (* v 10) (digit-val (String.char-at src j)))) (set! j (inc j))))
+              (set! toks (Array.push-back toks (Token.Int v)))
+              (set! i j))
+          (let-do [j i]
+            (while (and (< j n) (sym-char? (String.char-at src j))) (set! j (inc j)))
+            (set! toks (Array.push-back toks (Token.Sym (String.slice src i j))))
+            (set! i j)))))
+    toks))
+
+; ------------------------------------------------------------------ parser
+
+(def *pos* 0)
+
+(defn peek [toks] (Array.unsafe-nth toks *pos*))
+(defn advance [] (set! *pos* (inc *pos*)))
+(defn rparen? [t] (match-ref t (Token.RParen) true _ false))
+(defn head-sym [toks] (match-ref (peek toks) (Token.Sym s) @s _ @""))
+
+(defn op-char? [s]
+  (or (= s &@"+") (or (= s &@"-") (or (= s &@"*") (or (= s &@"/") (= s &@"<"))))))
+(defn op-of [s]
+  (cond (= s &@"+") \+ (= s &@"-") \- (= s &@"*") \* (= s &@"/") \/ \<))
+
+(defn parse-expr [toks]
+  (match-ref (peek toks)
+    (Token.Int n)    (do (advance) (Expr.Num @n))
+    (Token.Sym s)    (do (advance) (Expr.Var @s))
+    (Token.LParen)   (do (advance) (parse-form toks))
+    (Token.RParen)   (do (advance) (Expr.Num 0))))
+
+(defn parse-list [toks]
+  (let-do [acc []]
+    (while (not (rparen? (peek toks)))
+      (set! acc (Array.push-back acc (parse-expr toks))))
+    (advance)
+    acc))
+
+(defn box-exprs [xs]
+  (let-do [a [] i 0 n (Array.length &xs)]
+    (while (< i n) (do (set! a (Array.push-back a (Box.init @(Array.unsafe-nth &xs i)))) (set! i (inc i))))
+    a))
+
+(defn parse-form [toks]
+  (let-do [head (head-sym toks)]
+    (advance)
+    (let [args (parse-list toks)]
+      (cond
+        (= &head &@"if")
+          (Expr.If (Box.init @(Array.unsafe-nth &args 0))
+                   (Box.init @(Array.unsafe-nth &args 1))
+                   (Box.init @(Array.unsafe-nth &args 2)))
+        (op-char? &head)
+          (Expr.Bin (op-of &head)
+                    (Box.init @(Array.unsafe-nth &args 0))
+                    (Box.init @(Array.unsafe-nth &args 1)))
+        (Expr.Call head (box-exprs args))))))
+
+(defn parse-program [toks]
+  (let-do [funcs []
+           n (Array.length toks)]
+    (while (< *pos* n)
+      (do
+        (advance)                 ; '('
+        (advance)                 ; 'defn'
+        (let-do [name (head-sym toks)]
+          (advance)               ; name
+          (advance)               ; '(' of params
+          (let-do [params []]
+            (while (not (rparen? (peek toks)))
+              (do (set! params (Array.push-back params (head-sym toks))) (advance)))
+            (advance)             ; ')' of params
+            (let-do [body (parse-expr toks)]
+              (advance)           ; ')' of defn
+              (set! funcs (Array.push-back funcs (Func.init name params body))))))))
+    funcs))
+
+; ------------------------------------------------------------------ compiler
+
+(defn index-of-str [arr s]
+  (let-do [i 0 n (Array.length arr) res 0]
+    (while (< i n)
+      (do (when (= (Array.unsafe-nth arr i) s) (set! res i)) (set! i (inc i))))
+    res))
+
+(defn i32-array [ctx k]
+  (let-do [a [] i 0]
+    (while (< i k) (do (set! a (Array.push-back a (int32-type ctx))) (set! i (inc i))))
+    a))
+
+(defn compile-bin [ctx builder op lv rv]
+  (cond
+    (= op \+) (build-add builder lv rv (cstr &@"add"))
+    (= op \-) (build-sub builder lv rv (cstr &@"sub"))
+    (= op \*) (build-mul builder lv rv (cstr &@"mul"))
+    (= op \/) (build-sdiv builder lv rv (cstr &@"div"))
+    (build-zext builder
+      (build-icmp builder int-slt lv rv (cstr &@"lt")) (int32-type ctx) (cstr &@"ltz"))))
+
+(defn compile-expr [ctx builder mod func params expr]
+  (match-ref expr
+    (Expr.Num n) (const-int (int32-type ctx) (Long.from-int @n) 0)
+    (Expr.Var name) (get-param func (index-of-str params name))
+    (Expr.Bin op l r)
+      (let [le (Box.unbox @l)
+            re (Box.unbox @r)]
+        (compile-bin ctx builder @op
+          (compile-expr ctx builder mod func params &le)
+          (compile-expr ctx builder mod func params &re)))
+    (Expr.If c t e)
+      (let [ce (Box.unbox @c) te (Box.unbox @t) ee (Box.unbox @e)]
+        (compile-if ctx builder mod func params &ce &te &ee))
+    (Expr.Call name args)
+      (compile-call ctx builder mod func params name args)))
+
+(defn compile-if [ctx builder mod func params c t e]
+  (let-do [cv  (compile-expr ctx builder mod func params c)
+           cnd (build-icmp builder int-ne cv (const-int (int32-type ctx) 0l 0) (cstr &@"cond"))
+           then-bb  (append-block ctx func (cstr &@"then"))
+           else-bb  (append-block ctx func (cstr &@"else"))
+           merge-bb (append-block ctx func (cstr &@"merge"))]
+    (ignore (build-cond-br builder cnd then-bb else-bb))
+    (position-at-end builder then-bb)
+    (let-do [tv (compile-expr ctx builder mod func params t)
+             then-end (get-insert-block builder)]
+      (ignore (build-br builder merge-bb))
+      (position-at-end builder else-bb)
+      (let-do [ev (compile-expr ctx builder mod func params e)
+               else-end (get-insert-block builder)]
+        (ignore (build-br builder merge-bb))
+        (position-at-end builder merge-bb)
+        (let-do [phi (build-phi builder (int32-type ctx) (cstr &@"phi"))]
+          (add-incoming phi &[tv ev] &[then-end else-end])
+          phi)))))
+
+(defn compile-call [ctx builder mod func params name args]
+  (let-do [argvals []
+           k (Array.length args)
+           i 0]
+    (while (< i k)
+      (let-do [e (Box.unbox @(Array.unsafe-nth args i))]
+        (set! argvals (Array.push-back argvals (compile-expr ctx builder mod func params &e)))
+        (set! i (inc i))))
+    (build-call builder
+      (function-type (int32-type ctx) &(i32-array ctx k) false)
+      (get-named-function mod (cstr name))
+      &argvals (cstr &@"call"))))
+
+(defn compile-program [ctx builder mod funcs]
+  (let-do [i 0 n (Array.length funcs)]
+    (while-do (< i n)                    ; pass 1: declare every function
+      (let [f (Array.unsafe-nth funcs i)]
+        (ignore (add-function mod (cstr (Func.name f))
+                  (function-type (int32-type ctx) &(i32-array ctx (Array.length (Func.params f))) false))))
+      (set! i (inc i)))
+    (set! i 0)
+    (while-do (< i n)                    ; pass 2: compile bodies
+      (let-do [f (Array.unsafe-nth funcs i)
+               func (get-named-function mod (cstr (Func.name f)))
+               entry (append-block ctx func (cstr &@"entry"))]
+        (position-at-end builder entry)
+        (ignore (build-ret builder (compile-expr ctx builder mod func (Func.params f) (Func.body f)))))
+      (set! i (inc i)))))
+
+; ------------------------------------------------------------------ driver
+
+(defn main []
+  (let-do [src @"(defn fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (defn gcd (a b) (if (< b 1) a (gcd b (- a (* (/ a b) b)))))"
+           toks (tokenize &src)]
+    (set! *pos* 0)
+    (let-do [funcs (parse-program &toks)
+             ctx (context-create)
+             builder (builder-create ctx)
+             mod (module-create (cstr &@"mini") ctx)]
+      (compile-program ctx builder mod &funcs)
+      (IO.println "; ---- generated LLVM IR ----")
+      (IO.print &(print-module mod))
+      (let [v (verify-module mod)]
+        (if (String.empty? &v)
+          (IO.println "; module verified OK\n")
+          (IO.println &(fmt "; VERIFY FAILED: %s\n" &v))))
+
+      (ignore (initialize-native-target))
+      (ignore (initialize-native-asm-printer))
+      (let-do [triple (default-target-triple)
+               tm (create-target-machine (target-from-triple (cstr &triple)) (cstr &triple)
+                    (cstr &@"") (cstr &@"") codegen-level-default reloc-pic codemodel-default)]
+        (ignore (emit-to-file tm mod (cstr &@"out/mini.o") filetype-object))
+        (dispose-target-machine tm)
+        (IO.println "wrote out/mini.o"))
+
+      (link-in-mcjit)
+      (let-do [engine (create-execution-engine mod)
+               fib (function-address engine (cstr &@"fib"))
+               gcd (function-address engine (cstr &@"gcd"))]
+        (IO.println "\n; ---- running JIT-compiled native code ----")
+        (IO.println &(fmt "fib(10)        = %d" (call-i32-i32 fib 10)))
+        (IO.println &(fmt "fib(20)        = %d" (call-i32-i32 fib 20)))
+        (IO.println &(fmt "gcd(48, 36)    = %d" (call-i32-i32-i32 gcd 48 36)))
+        (IO.println &(fmt "gcd(1071, 462) = %d" (call-i32-i32-i32 gcd 1071 462)))
+        (engine-dispose engine))
+      (builder-dispose builder)
+      (context-dispose ctx)
+      0)))

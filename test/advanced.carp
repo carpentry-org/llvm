@@ -1,0 +1,175 @@
+(load "../llvm.carp")
+(load "Test.carp")
+
+(LLVM.setup)
+
+(use Test)
+(use LLVM)
+
+(defn cstr [s] (String.cstr s))
+
+(deftype Adv [pre-alloca Bool pass-err String post-alloca Bool
+              vec-err String vec-has Bool
+              attr-has Bool
+              dbg-err String dbg-has Bool
+              parse-ok Bool parse-has Bool bc-rc Int])
+
+(deftype PassR [pre Bool err String post Bool])
+(deftype VecR [err String has Bool])
+(deftype DbgR [err String has Bool])
+(deftype IoR [rc Int ok Bool has Bool])
+
+(defn host-target-machine []
+  (do
+    (ignore (initialize-native-target))
+    (ignore (initialize-native-asm-printer))
+    (let [triple (default-target-triple)]
+      (create-target-machine (target-from-triple (cstr &triple)) (cstr &triple)
+        (cstr &@"") (cstr &@"") codegen-level-default reloc-pic codemodel-default))))
+
+; --- passes: a dead alloca should be gone after default<O2> ---
+(defn part-passes []
+  (let-do [ctx (context-create)
+           builder (builder-create ctx)
+           mod (module-create (cstr &@"opt") ctx)
+           params [(int32-type ctx)]
+           fnty (function-type (int32-type ctx) &params false)
+           func (add-function mod (cstr &@"f") fnty)
+           entry (append-block ctx func (cstr &@"entry"))]
+    (position-at-end builder entry)
+    (let-do [slot (build-alloca builder (int32-type ctx) (cstr &@"slot"))
+             x (get-param func 0)]
+      (ignore (build-store builder x slot))
+      (ignore (build-ret builder (build-add builder x x (cstr &@"y")))))
+    (let-do [pre (String.contains-string? &(print-module mod) &@"alloca")
+             tm (host-target-machine)
+             opts (pass-options-create)
+             err (run-passes mod (cstr &@"default<O2>") tm opts)
+             post (String.contains-string? &(print-module mod) &@"alloca")]
+      (pass-options-dispose opts)
+      (dispose-target-machine tm)
+      (builder-dispose builder)
+      (context-dispose ctx)
+      (PassR.init pre err post))))
+
+; --- vectors: <4 x i32> add verifies and shows in the IR ---
+(defn part-vectors []
+  (let-do [ctx (context-create)
+           builder (builder-create ctx)
+           mod (module-create (cstr &@"vec") ctx)
+           v4 (vector-type (int32-type ctx) 4)
+           params [(vector-type (int32-type ctx) 4) (vector-type (int32-type ctx) 4)]
+           fnty (function-type v4 &params false)
+           func (add-function mod (cstr &@"vadd") fnty)
+           entry (append-block ctx func (cstr &@"entry"))]
+    (position-at-end builder entry)
+    (ignore (build-ret builder (build-add builder (get-param func 0) (get-param func 1) (cstr &@"s"))))
+    (let-do [err (verify-module mod)
+             has (String.contains-string? &(print-module mod) &@"<4 x i32>")]
+      (builder-dispose builder)
+      (context-dispose ctx)
+      (VecR.init err has))))
+
+; --- attributes: noinline shows up on the function ---
+(defn part-attributes []
+  (let-do [ctx (context-create)
+           mod (module-create (cstr &@"attr") ctx)
+           params [(int32-type ctx)]
+           fnty (function-type (int32-type ctx) &params false)
+           func (add-function mod (cstr &@"g") fnty)]
+    (add-attribute func attr-function-index
+      (create-enum-attribute ctx (enum-attribute-kind (cstr &@"noinline")) 0l))
+    (let-do [has (String.contains-string? &(print-module mod) &@"noinline")]
+      (context-dispose ctx)
+      has)))
+
+; --- debug info: attach a subprogram, verify, see it in the IR ---
+(defn part-debug []
+  (let-do [ctx (context-create)
+           builder (builder-create ctx)
+           mod (module-create (cstr &@"dbg") ctx)
+           params [(int32-type ctx)]
+           fnty (function-type (int32-type ctx) &params false)
+           func (add-function mod (cstr &@"dbgfn") fnty)
+           entry (append-block ctx func (cstr &@"entry"))
+           dib (di-builder-create mod)
+           file (di-file dib (cstr &@"test.c") (cstr &@"/tmp"))
+           cu (di-compile-unit dib file (cstr &@"carp-llvm"))
+           subty (di-subroutine-type dib file
+                   &[(di-basic-type dib (cstr &@"int") 32l dwarf-signed)
+                     (di-basic-type dib (cstr &@"int") 32l dwarf-signed)])
+           sp (di-function dib cu (cstr &@"dbgfn") file 1 subty)]
+    (set-subprogram func sp)
+    (add-module-flag mod behavior-warning (cstr &@"Debug Info Version")
+      (value-as-metadata (const-int (int32-type ctx) 3l 0)))
+    (position-at-end builder entry)
+    (set-debug-location builder (debug-location ctx 2 3 sp))
+    (ignore (build-ret builder (get-param func 0)))
+    (di-finalize dib)
+    (let-do [err (verify-module mod)
+             has (String.contains-string? &(print-module mod) &@"DISubprogram")]
+      (di-builder-dispose dib)
+      (builder-dispose builder)
+      (context-dispose ctx)
+      (DbgR.init err has))))
+
+; --- I/O: write .ll and .bc, parse the .ll back into a fresh context ---
+(defn part-io []
+  (let-do [ctx (context-create)
+           mod (module-create (cstr &@"io") ctx)
+           params [(int32-type ctx)]
+           fnty (function-type (int32-type ctx) &params false)
+           func (add-function mod (cstr &@"io_fn") fnty)
+           entry (append-block ctx func (cstr &@"entry"))
+           builder (builder-create ctx)]
+    (position-at-end builder entry)
+    (ignore (build-ret builder (get-param func 0)))
+    (ignore (write-module-to-file mod (cstr &@"out/io.ll")))
+    (let-do [bc-rc (write-bitcode-to-file mod (cstr &@"out/io.bc"))
+             ctx2 (context-create)
+             buf (memory-buffer-of-file (cstr &@"out/io.ll"))
+             parsed (parse-ir ctx2 buf)
+             ok (not (module-null? parsed))
+             has (if ok (String.contains-string? &(print-module parsed) &@"io_fn") false)]
+      (unless (module-null? parsed) (module-dispose parsed))
+      (context-dispose ctx2)
+      (builder-dispose builder)
+      (context-dispose ctx)
+      (IoR.init bc-rc ok has))))
+
+(defn lower-advanced []
+  (let [p (part-passes)
+        v (part-vectors)
+        d (part-debug)
+        io (part-io)]
+    (Adv.init @(PassR.pre &p) @(PassR.err &p) @(PassR.post &p)
+              @(VecR.err &v) @(VecR.has &v)
+              (part-attributes)
+              @(DbgR.err &d) @(DbgR.has &d)
+              @(IoR.ok &io) @(IoR.has &io) @(IoR.rc &io))))
+
+(def adv (lower-advanced))
+
+(deftest test
+  (assert-true test @(Adv.pre-alloca &adv)
+    "pre-optimization IR has an alloca")
+  (assert-true test (String.empty? (Adv.pass-err &adv))
+    "run-passes default<O2> succeeded")
+  (assert-false test @(Adv.post-alloca &adv)
+    "default<O2> eliminated the dead alloca")
+  (assert-true test (String.empty? (Adv.vec-err &adv))
+    "vector module verifies")
+  (assert-true test @(Adv.vec-has &adv)
+    "IR contains a <4 x i32> vector type")
+  (assert-true test @(Adv.attr-has &adv)
+    "function carries the noinline attribute")
+  (assert-true test (String.empty? (Adv.dbg-err &adv))
+    "module with debug info verifies")
+  (assert-true test @(Adv.dbg-has &adv)
+    "IR contains a DISubprogram")
+  (assert-equal test 0 @(Adv.bc-rc &adv)
+    "bitcode written successfully")
+  (assert-true test @(Adv.parse-ok &adv)
+    "written .ll parses back into a module")
+  (assert-true test @(Adv.parse-has &adv)
+    "round-tripped module still declares io_fn"))
