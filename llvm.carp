@@ -369,6 +369,10 @@ Returns a null handle on failure (check with `engine-null?`).")
     "$DECL { return e == NULL; }")
   (doc engine-dispose "Free an execution engine (and the module it owns).")
   (register engine-dispose (Fn [LLVMEngine] ()) "LLVMDisposeExecutionEngine")
+  (doc add-module "Add another module to an engine; the engine takes ownership
+and compiles it on the next symbol request, resolving externs against every
+module it holds and the process.")
+  (register add-module (Fn [LLVMEngine LLVMModule] ()) "LLVMAddModule")
   (doc function-address "Address of JIT-compiled function `name` as a Long, or 0 if absent.")
   (register function-address (Fn [LLVMEngine (Ptr CChar)] Long) "LLVMGetFunctionAddress")
 
