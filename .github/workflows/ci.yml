@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Carp
+        uses: carpentry-org/setup-carp@v1
+
+      - name: Install LLVM (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev
+
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install llvm
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          carp -x test/llvm.carp
+          carp -x test/frontend.carp
+          carp -x test/advanced.carp
+          carp -x test/orc.carp
+          carp -x examples/mini.carp
+
+      - name: Install angler
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/carpentry-org/angler /tmp/angler
+          (cd /tmp/angler && carp -b main.carp)
+          sudo install -m 755 /tmp/angler/out/angler /usr/local/bin/
+
+      - name: Install carp-fmt
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/carpentry-org/carp-fmt /tmp/carp-fmt
+          (cd /tmp/carp-fmt && carp -b main.carp)
+          sudo install -m 755 /tmp/carp-fmt/out/carp-fmt /usr/local/bin/
+
+      - name: Lint
+        run: |
+          angler $(find . -name '*.carp' \
+            -not -path './out/*' \
+            -not -path './docs/*' \
+            -not -path './.carp-src/*' \
+            -not -path './examples/*')
+
+      - name: Format check
+        run: |
+          carp-fmt --check $(find . -name '*.carp' \
+            -not -path './out/*' \
+            -not -path './docs/*' \
+            -not -path './.carp-src/*' \
+            -not -path './examples/*')
+
+      - name: Generate docs
+        run: carp -x gendocs.carp

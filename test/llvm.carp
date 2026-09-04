@@ -9,7 +9,9 @@
 ; Build `i32 add(i32 a, i32 b) { return a + b; }` into a fresh module,
 ; capturing the textual IR, the verifier verdict, and the JIT result of
 ; add(20, 22).
-(deftype Built [ir String verify String jit Int])
+(deftype Built [ir String
+                verify String
+                jit Int])
 
 (defn build-add-module []
   (let-do [ctx (context-create)
@@ -32,9 +34,9 @@
         (ignore (initialize-native-asm-printer))
         (let-do [engine (create-execution-engine mod)
                  result (if (engine-null? engine)
-                          -1
-                          (let [addr (function-address engine (String.cstr &@"add"))]
-                            (call-i32-i32-i32 addr 20 22)))]
+                   -1
+                   (let [addr (function-address engine (String.cstr &@"add"))]
+                     (call-i32-i32-i32 addr 20 22)))]
           (unless (engine-null? engine) (engine-dispose engine))
           (builder-dispose builder)
           ; note: engine-dispose already freed the module it owned
@@ -45,9 +47,13 @@
 (def built (build-add-module))
 
 (deftest test
-  (assert-true test (String.empty? (Built.verify &built))
+  (assert-true test
+    (String.empty? (Built.verify &built))
     "generated module passes the verifier")
-  (assert-true test (String.contains-string? (Built.ir &built) &@"define i32 @add")
+  (assert-true test
+    (String.contains-string? (Built.ir &built) &@"define i32 @add")
     "IR declares the add function")
-  (assert-equal test 42 @(Built.jit &built)
+  (assert-equal test
+    42
+    @(Built.jit &built)
     "JIT-compiled add(20, 22) returns 42"))

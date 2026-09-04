@@ -11,19 +11,23 @@ Two layers, following the `lua`/`luax` precedent:
 
 ## Prerequisites
 
-LLVM must be installed with its development headers and a linkable `libLLVM`.
-On macOS via Homebrew:
+LLVM must be installed with its development headers, `llvm-config`, and a
+linkable `libLLVM`. On macOS via Homebrew:
 
 ```
 brew install llvm
 ```
 
-`LLVM.setup` defaults to the Homebrew keg at `/opt/homebrew/opt/llvm`. Pass a
-different prefix (e.g. `llvm-config --prefix`) if yours lives elsewhere:
+`LLVM.setup` uses `brew --prefix llvm` by default on macOS and
+`llvm-config --prefix` on other systems. Pass a different prefix if LLVM lives
+elsewhere:
 
 ```
 (LLVM.setup "/usr/lib/llvm-18")
 ```
+
+Version 0.1.0 is tested against LLVM 22.1.8 on macOS. CI is configured to also
+exercise the distribution LLVM package on Ubuntu.
 
 ## Usage
 
@@ -73,9 +77,17 @@ are owned by their context/module and must never be freed individually, so they
 carry no `delete`. An execution engine takes ownership of the module handed to
 it, so `engine-dispose` frees that module too — do not also dispose it yourself.
 
+ORC has an additional ownership chain. `orc-thread-safe-context` takes ownership
+of its `LLVMContext`, and `orc-thread-safe-module` takes ownership of its
+`LLVMModule`. Publishing that wrapper with `orc-add-module` or
+`orc-add-module-tracked` transfers it to the JIT, including on failure. Release
+the caller's resource-tracker reference with `orc-release-resource-tracker`.
+Removing its resources, clearing its JIT dylib, or disposing the LLJIT
+invalidates addresses into the affected machine code.
+
 ## Scope
 
-A broad working subset (~139 LLVM-C functions across 10 headers, 53 of the 112
+A broad working subset (~159 LLVM-C functions across 12 headers, 53 of the 112
 `LLVMBuild*` instructions), enough to lower and ship a real language frontend:
 
 - **Types** — int (1/8/16/32/64), float, double, void, pointer, array, function,
@@ -91,17 +103,17 @@ A broad working subset (~139 LLVM-C functions across 10 headers, 53 of the 112
   attributes (enum + string), metadata (nodes, named metadata, module flags,
   instruction metadata).
 - **Debug info** — DWARF via a `DIBuilder`: files, compile units, basic and
-  subroutine types, subprograms, and source locations.
+  subroutine types, subprograms, lexical file scopes, and source locations.
 - **Backends** — verification, optimization (`run-passes` with the new pass
-  manager, e.g. `"default<O2>"`), MCJIT execution, AOT emission of a native
-  object/assembly file, bitcode writing, and reading textual IR or bitcode back
-  in (`memory-buffer-of-file` + `parse-ir`).
+  manager, e.g. `"default<O2>"`), MCJIT execution, persistent ORC LLJIT
+  contexts/modules/resource trackers, AOT emission of a native object/assembly
+  file, bitcode writing, and reading textual IR or bitcode back in
+  (`memory-buffer-of-file` + `parse-ir`).
 
-It targets the callback-light MCJIT path rather than ORC (capturing Carp
-closures do not become C function pointers), and binds the host target for
-codegen. Not covered: the ORC/LLJIT APIs, the full `DIBuilder` surface (local
-variables, composite/derived types, expressions), attribute introspection, and
-the linker.
+It binds both the callback-light MCJIT path and ORC LLJIT's C API, plus the
+host target for codegen. Not covered: the full `DIBuilder` surface (local
+variables, composite/derived types, expressions), attribute introspection,
+and the linker.
 
 ## Example: a tiny language
 
@@ -134,6 +146,8 @@ working binary that calls `fib`/`gcd` directly.
 carp -x test/llvm.carp       # build → verify → JIT an add function
 carp -x test/frontend.carp   # structs, casts, GEP, switch, globals; JIT + emit a .o
 carp -x test/advanced.carp   # passes, vectors, attributes, debug info, IR/bitcode round-trip
+carp -x test/orc.carp        # persistent ORC LLJIT, resource removal, float calls
+carp -x examples/mini.carp   # complete parser → IR → JIT/object-file smoke test
 ```
 
 `frontend.carp` lowers two functions and emits a real host object file to
@@ -141,3 +155,17 @@ carp -x test/advanced.carp   # passes, vectors, attributes, debug info, IR/bitco
 `advanced.carp` runs `default<O2>` (and checks a dead alloca is gone), builds a
 `<4 x i32>` vector op, attaches `noinline` and a `DISubprogram`, and writes then
 re-parses `out/io.ll` / `out/io.bc`.
+
+## API documentation
+
+Generate the `LLVM` and `LLVMx` API reference with:
+
+```sh
+carp -x gendocs.carp
+```
+
+The generated landing page is `docs/index.html`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

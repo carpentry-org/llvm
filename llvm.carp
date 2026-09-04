@@ -28,13 +28,22 @@
 (register-type LLVMAttribute "LLVMAttributeRef")
 (register-type LLVMMetadata "LLVMMetadataRef")
 (register-type LLVMDIBuilder "LLVMDIBuilderRef")
+(register-type LLVMOrcLLJIT "LLVMOrcLLJITRef")
+(register-type LLVMOrcThreadSafeContext "LLVMOrcThreadSafeContextRef")
+(register-type LLVMOrcThreadSafeModule "LLVMOrcThreadSafeModuleRef")
+(register-type LLVMOrcJITDylib "LLVMOrcJITDylibRef")
+(register-type LLVMOrcResourceTracker "LLVMOrcResourceTrackerRef")
 
 (defmodule LLVM
   (doc setup "Wire include paths and linking against a Homebrew LLVM keg.
-`prefix` defaults to `\"/opt/homebrew/opt/llvm\"`; pass another path (e.g. the
-output of `llvm-config --prefix`) as the first argument to override it.")
+`prefix` defaults to the Homebrew LLVM keg on macOS and the output of
+`llvm-config --prefix` elsewhere. Pass another LLVM prefix as the first
+argument to override it.")
   (defndynamic setup [:rest prefix]
-    (let [root (if (> (length prefix) 0) (car prefix) "/opt/homebrew/opt/llvm")]
+    (let [root (cond
+            (> (length prefix) 0) (car prefix)
+            (= (host-os) "darwin") "$(brew --prefix llvm)"
+            "$(llvm-config --prefix)")]
       (eval
         `(do
           (add-cflag %(Dynamic.String.concat ["-I" root "/include"]))
@@ -49,54 +58,69 @@ output of `llvm-config --prefix`) as the first argument to override it.")
           (system-include "llvm-c/IRReader.h")
           (system-include "llvm-c/Error.h")
           (system-include "llvm-c/DebugInfo.h")
-          (system-include "llvm-c/Transforms/PassBuilder.h")))))
+          (system-include "llvm-c/Transforms/PassBuilder.h")
+          (system-include "llvm-c/Orc.h")
+          (system-include "llvm-c/LLJIT.h")))))
 
   ; --- generic array->raw-pointer helper (LLVM takes C arrays of handles) ---
   (doc raw "Raw data pointer of an array, for passing handle arrays to C.")
-  (deftemplate raw (Fn [(Ref (Array a))] (Ptr a))
-    "$a* $NAME(Array* arr)"
-    "$DECL { return arr->data; }")
+  (deftemplate raw
+               (Fn [(Ref (Array a))] (Ptr a))
+               "$a* $NAME(Array* arr)"
+               "$DECL { return arr->data; }")
   (hidden raw)
 
-  (doc dup "Duplicate a handle out of a reference (e.g. from an array or accessor).
+  (doc dup
+    "Duplicate a handle out of a reference (e.g. from an array or accessor).
 Handles are trivially copyable pointers, but the `@` operator needs a `copy`
 implementation they can't have, so use this instead.")
-  (deftemplate dup (Fn [&a] a)
-    "$a $NAME($a* p)"
-    "$DECL { return *p; }")
+  (deftemplate dup (Fn [&a] a) "$a $NAME($a* p)" "$DECL { return *p; }")
 
   ; --- context ---
-  (doc context-create "Create a fresh LLVM context. Dispose with `context-dispose`.")
+  (doc context-create
+    "Create a fresh LLVM context. Dispose with `context-dispose`.")
   (register context-create (Fn [] LLVMContext) "LLVMContextCreate")
   (doc context-dispose "Free a context and everything it owns.")
   (register context-dispose (Fn [LLVMContext] ()) "LLVMContextDispose")
 
   ; --- module ---
   (doc module-create "Create a module named `name` in `ctx`.")
-  (register module-create (Fn [(Ptr CChar) LLVMContext] LLVMModule) "LLVMModuleCreateWithNameInContext")
+  (register module-create
+    (Fn [(Ptr CChar) LLVMContext] LLVMModule)
+    "LLVMModuleCreateWithNameInContext")
   (doc module-dispose "Free a module.")
   (register module-dispose (Fn [LLVMModule] ()) "LLVMDisposeModule")
 
-  (doc print-module "Render a module's textual IR as a Carp String (owns the copy).")
-  (deftemplate print-module (Fn [LLVMModule] String)
-    "String $NAME(LLVMModuleRef m)"
-    "$DECL { char* s = LLVMPrintModuleToString(m); char* out = strdup(s); LLVMDisposeMessage(s); return out; }")
+  (doc print-module
+    "Render a module's textual IR as a Carp String (owns the copy).")
+  (deftemplate print-module
+               (Fn [LLVMModule] String)
+               "String $NAME(LLVMModuleRef m)"
+               "$DECL { char* s = LLVMPrintModuleToString(m); char* out = strdup(s); LLVMDisposeMessage(s); return out; }")
 
-  (doc write-module-to-file "Write textual IR to `path`. Returns \"\" on success or an error String.")
-  (deftemplate write-module-to-file (Fn [LLVMModule (Ptr CChar)] String)
-    "String $NAME(LLVMModuleRef m, const char* path)"
-    "$DECL { char* err = NULL; LLVMBool bad = LLVMPrintModuleToFile(m, path, &err); char* out = strdup((bad && err) ? err : \"\"); if (err) LLVMDisposeMessage(err); return out; }")
+  (doc write-module-to-file
+    "Write textual IR to `path`. Returns \"\" on success or an error String.")
+  (deftemplate write-module-to-file
+               (Fn [LLVMModule (Ptr CChar)] String)
+               "String $NAME(LLVMModuleRef m, const char* path)"
+               "$DECL { char* err = NULL; LLVMBool bad = LLVMPrintModuleToFile(m, path, &err); char* out = strdup((bad && err) ? err : \"\"); if (err) LLVMDisposeMessage(err); return out; }")
 
   ; --- builder ---
   (doc builder-create "Create an IR builder bound to `ctx`.")
-  (register builder-create (Fn [LLVMContext] LLVMBuilder) "LLVMCreateBuilderInContext")
+  (register builder-create
+    (Fn [LLVMContext] LLVMBuilder)
+    "LLVMCreateBuilderInContext")
   (doc builder-dispose "Free a builder.")
   (register builder-dispose (Fn [LLVMBuilder] ()) "LLVMDisposeBuilder")
   (doc position-at-end "Point the builder at the end of `block`.")
-  (register position-at-end (Fn [LLVMBuilder LLVMBasicBlock] ()) "LLVMPositionBuilderAtEnd")
+  (register position-at-end
+    (Fn [LLVMBuilder LLVMBasicBlock] ())
+    "LLVMPositionBuilderAtEnd")
   (doc get-insert-block "The basic block the builder is currently appending to
 (needed as the incoming block for a phi after emitting a branch's body).")
-  (register get-insert-block (Fn [LLVMBuilder] LLVMBasicBlock) "LLVMGetInsertBlock")
+  (register get-insert-block
+    (Fn [LLVMBuilder] LLVMBasicBlock)
+    "LLVMGetInsertBlock")
 
   ; --- types ---
   (doc int1-type "The i1 (boolean) type.")
@@ -121,64 +145,99 @@ implementation they can't have, so use this instead.")
   (register array-type (Fn [LLVMType Int] LLVMType) "LLVMArrayType")
 
   (hidden function-type-raw)
-  (register function-type-raw (Fn [LLVMType (Ptr LLVMType) Int Int] LLVMType) "LLVMFunctionType")
-  (doc function-type "Function type returning `ret` with parameter types `params`.
+  (register function-type-raw
+    (Fn [LLVMType (Ptr LLVMType) Int Int] LLVMType)
+    "LLVMFunctionType")
+  (doc function-type
+    "Function type returning `ret` with parameter types `params`.
 `vararg?` marks a C-style variadic function.")
   (defn function-type [ret params vararg?]
     (function-type-raw ret (raw params) (Array.length params) (if vararg? 1 0)))
 
   ; --- constants ---
-  (doc const-int "An integer constant of type `ty`. `sign-extend?` sign-extends `n`.")
+  (doc const-int
+    "An integer constant of type `ty`. `sign-extend?` sign-extends `n`.")
   (register const-int (Fn [LLVMType Long Int] LLVMValue) "LLVMConstInt")
   (doc const-real "A floating-point constant of type `ty`.")
   (register const-real (Fn [LLVMType Double] LLVMValue) "LLVMConstReal")
-  (doc const-null "The all-zero/null constant of type `ty` (good for initializers).")
+  (doc const-null
+    "The all-zero/null constant of type `ty` (good for initializers).")
   (register const-null (Fn [LLVMType] LLVMValue) "LLVMConstNull")
 
   ; --- aggregate & pointer types ---
   (hidden struct-type-raw)
-  (register struct-type-raw (Fn [LLVMContext (Ptr LLVMType) Int Int] LLVMType) "LLVMStructTypeInContext")
-  (doc struct-type "An anonymous struct type with fields `elems`. `packed?` removes padding.")
+  (register struct-type-raw
+    (Fn [LLVMContext (Ptr LLVMType) Int Int] LLVMType)
+    "LLVMStructTypeInContext")
+  (doc struct-type
+    "An anonymous struct type with fields `elems`. `packed?` removes padding.")
   (defn struct-type [ctx elems packed?]
     (struct-type-raw ctx (raw elems) (Array.length elems) (if packed? 1 0)))
-  (doc struct-create-named "Create an (initially opaque) named struct type in `ctx`.
+  (doc struct-create-named
+    "Create an (initially opaque) named struct type in `ctx`.
 Fill it in later with `struct-set-body` — this is how you build recursive types.")
-  (register struct-create-named (Fn [LLVMContext (Ptr CChar)] LLVMType) "LLVMStructCreateNamed")
+  (register struct-create-named
+    (Fn [LLVMContext (Ptr CChar)] LLVMType)
+    "LLVMStructCreateNamed")
   (hidden struct-set-body-raw)
-  (register struct-set-body-raw (Fn [LLVMType (Ptr LLVMType) Int Int] ()) "LLVMStructSetBody")
+  (register struct-set-body-raw
+    (Fn [LLVMType (Ptr LLVMType) Int Int] ())
+    "LLVMStructSetBody")
   (doc struct-set-body "Set the field types of a named struct.")
   (defn struct-set-body [ty elems packed?]
     (struct-set-body-raw ty (raw elems) (Array.length elems) (if packed? 1 0)))
 
   ; --- functions, params, blocks ---
   (doc add-function "Declare a function `name` of type `ty` in `mod`.")
-  (register add-function (Fn [LLVMModule (Ptr CChar) LLVMType] LLVMValue) "LLVMAddFunction")
+  (register add-function
+    (Fn [LLVMModule (Ptr CChar) LLVMType] LLVMValue)
+    "LLVMAddFunction")
   (doc get-param "The `i`-th parameter of function value `fn`.")
   (register get-param (Fn [LLVMValue Int] LLVMValue) "LLVMGetParam")
   (doc append-block "Append a basic block named `name` to function `fn`.")
-  (register append-block (Fn [LLVMContext LLVMValue (Ptr CChar)] LLVMBasicBlock) "LLVMAppendBasicBlockInContext")
+  (register append-block
+    (Fn [LLVMContext LLVMValue (Ptr CChar)] LLVMBasicBlock)
+    "LLVMAppendBasicBlockInContext")
 
   ; --- arithmetic ---
   (doc build-add "Emit `lhs + rhs` (integer).")
-  (register build-add (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildAdd")
+  (register build-add
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildAdd")
   (doc build-sub "Emit `lhs - rhs` (integer).")
-  (register build-sub (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildSub")
+  (register build-sub
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildSub")
   (doc build-mul "Emit `lhs * rhs` (integer).")
-  (register build-mul (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildMul")
+  (register build-mul
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildMul")
   (doc build-sdiv "Emit signed `lhs / rhs`.")
-  (register build-sdiv (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildSDiv")
+  (register build-sdiv
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildSDiv")
   (doc build-fadd "Emit `lhs + rhs` (floating point).")
-  (register build-fadd (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildFAdd")
+  (register build-fadd
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildFAdd")
   (doc build-fmul "Emit `lhs * rhs` (floating point).")
-  (register build-fmul (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildFMul")
+  (register build-fmul
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildFMul")
 
   ; --- memory ---
   (doc build-alloca "Stack-allocate a slot of type `ty`.")
-  (register build-alloca (Fn [LLVMBuilder LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildAlloca")
+  (register build-alloca
+    (Fn [LLVMBuilder LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildAlloca")
   (doc build-load "Load a `ty` value from pointer `ptr`.")
-  (register build-load (Fn [LLVMBuilder LLVMType LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildLoad2")
+  (register build-load
+    (Fn [LLVMBuilder LLVMType LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildLoad2")
   (doc build-store "Store `val` into pointer `ptr`.")
-  (register build-store (Fn [LLVMBuilder LLVMValue LLVMValue] LLVMValue) "LLVMBuildStore")
+  (register build-store
+    (Fn [LLVMBuilder LLVMValue LLVMValue] LLVMValue)
+    "LLVMBuildStore")
 
   ; --- control flow ---
   (doc build-ret "Emit `ret val`.")
@@ -188,405 +247,792 @@ Fill it in later with `struct-set-body` — this is how you build recursive type
   (doc build-br "Emit an unconditional branch to `dest`.")
   (register build-br (Fn [LLVMBuilder LLVMBasicBlock] LLVMValue) "LLVMBuildBr")
   (doc build-cond-br "Branch to `then` if `cond` else `else`.")
-  (register build-cond-br (Fn [LLVMBuilder LLVMValue LLVMBasicBlock LLVMBasicBlock] LLVMValue) "LLVMBuildCondBr")
+  (register build-cond-br
+    (Fn [LLVMBuilder LLVMValue LLVMBasicBlock LLVMBasicBlock] LLVMValue)
+    "LLVMBuildCondBr")
   (doc build-phi "Emit a phi node of type `ty`.")
-  (register build-phi (Fn [LLVMBuilder LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildPhi")
+  (register build-phi
+    (Fn [LLVMBuilder LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildPhi")
   (doc build-unreachable "Emit an `unreachable` terminator.")
-  (register build-unreachable (Fn [LLVMBuilder] LLVMValue) "LLVMBuildUnreachable")
+  (register build-unreachable
+    (Fn [LLVMBuilder] LLVMValue)
+    "LLVMBuildUnreachable")
 
   (hidden add-incoming-raw)
-  (register add-incoming-raw (Fn [LLVMValue (Ptr LLVMValue) (Ptr LLVMBasicBlock) Int] ()) "LLVMAddIncoming")
-  (doc add-incoming "Add incoming `vals`/`blocks` (parallel arrays) to a phi node.")
+  (register add-incoming-raw
+    (Fn [LLVMValue (Ptr LLVMValue) (Ptr LLVMBasicBlock) Int] ())
+    "LLVMAddIncoming")
+  (doc add-incoming
+    "Add incoming `vals`/`blocks` (parallel arrays) to a phi node.")
   (defn add-incoming [phi vals blocks]
     (add-incoming-raw phi (raw vals) (raw blocks) (Array.length vals)))
 
   ; integer comparison predicates (for build-icmp)
-  (doc int-eq "icmp predicate: equal.")            (register int-eq Int "LLVMIntEQ")
-  (doc int-ne "icmp predicate: not equal.")        (register int-ne Int "LLVMIntNE")
-  (doc int-ugt "icmp predicate: unsigned >.")      (register int-ugt Int "LLVMIntUGT")
-  (doc int-uge "icmp predicate: unsigned >=.")     (register int-uge Int "LLVMIntUGE")
-  (doc int-ult "icmp predicate: unsigned <.")      (register int-ult Int "LLVMIntULT")
-  (doc int-ule "icmp predicate: unsigned <=.")     (register int-ule Int "LLVMIntULE")
-  (doc int-sgt "icmp predicate: signed >.")        (register int-sgt Int "LLVMIntSGT")
-  (doc int-sge "icmp predicate: signed >=.")       (register int-sge Int "LLVMIntSGE")
-  (doc int-slt "icmp predicate: signed <.")        (register int-slt Int "LLVMIntSLT")
-  (doc int-sle "icmp predicate: signed <=.")       (register int-sle Int "LLVMIntSLE")
-  (doc build-icmp "Emit an integer comparison with one of the `int-*` predicates.")
-  (register build-icmp (Fn [LLVMBuilder Int LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildICmp")
+  (doc int-eq "icmp predicate: equal.")
+  (register int-eq Int "LLVMIntEQ")
+  (doc int-ne "icmp predicate: not equal.")
+  (register int-ne Int "LLVMIntNE")
+  (doc int-ugt "icmp predicate: unsigned >.")
+  (register int-ugt Int "LLVMIntUGT")
+  (doc int-uge "icmp predicate: unsigned >=.")
+  (register int-uge Int "LLVMIntUGE")
+  (doc int-ult "icmp predicate: unsigned <.")
+  (register int-ult Int "LLVMIntULT")
+  (doc int-ule "icmp predicate: unsigned <=.")
+  (register int-ule Int "LLVMIntULE")
+  (doc int-sgt "icmp predicate: signed >.")
+  (register int-sgt Int "LLVMIntSGT")
+  (doc int-sge "icmp predicate: signed >=.")
+  (register int-sge Int "LLVMIntSGE")
+  (doc int-slt "icmp predicate: signed <.")
+  (register int-slt Int "LLVMIntSLT")
+  (doc int-sle "icmp predicate: signed <=.")
+  (register int-sle Int "LLVMIntSLE")
+  (doc build-icmp
+    "Emit an integer comparison with one of the `int-*` predicates.")
+  (register build-icmp
+    (Fn [LLVMBuilder Int LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildICmp")
 
   (hidden build-call-raw)
-  (register build-call-raw (Fn [LLVMBuilder LLVMType LLVMValue (Ptr LLVMValue) Int (Ptr CChar)] LLVMValue) "LLVMBuildCall2")
+  (register build-call-raw
+    (Fn
+      [LLVMBuilder LLVMType LLVMValue (Ptr LLVMValue) Int (Ptr CChar)]
+      LLVMValue)
+    "LLVMBuildCall2")
   (doc build-call "Emit a call to `fn` (of type `fnty`) with `args`.")
   (defn build-call [b fnty fn args name]
     (build-call-raw b fnty fn (raw args) (Array.length args) name))
 
   ; --- more integer / bitwise arithmetic ---
   (doc build-and "Emit `lhs & rhs`.")
-  (register build-and (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildAnd")
+  (register build-and
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildAnd")
   (doc build-or "Emit `lhs | rhs`.")
-  (register build-or (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildOr")
+  (register build-or
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildOr")
   (doc build-xor "Emit `lhs ^ rhs`.")
-  (register build-xor (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildXor")
+  (register build-xor
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildXor")
   (doc build-shl "Emit `lhs << rhs`.")
-  (register build-shl (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildShl")
+  (register build-shl
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildShl")
   (doc build-lshr "Emit logical `lhs >> rhs`.")
-  (register build-lshr (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildLShr")
+  (register build-lshr
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildLShr")
   (doc build-ashr "Emit arithmetic `lhs >> rhs`.")
-  (register build-ashr (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildAShr")
+  (register build-ashr
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildAShr")
   (doc build-udiv "Emit unsigned `lhs / rhs`.")
-  (register build-udiv (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildUDiv")
+  (register build-udiv
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildUDiv")
   (doc build-urem "Emit unsigned `lhs % rhs`.")
-  (register build-urem (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildURem")
+  (register build-urem
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildURem")
   (doc build-srem "Emit signed `lhs % rhs`.")
-  (register build-srem (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildSRem")
+  (register build-srem
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildSRem")
   (doc build-fsub "Emit `lhs - rhs` (floating point).")
-  (register build-fsub (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildFSub")
+  (register build-fsub
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildFSub")
   (doc build-fdiv "Emit `lhs / rhs` (floating point).")
-  (register build-fdiv (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildFDiv")
+  (register build-fdiv
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildFDiv")
   (doc build-frem "Emit `lhs % rhs` (floating point).")
-  (register build-frem (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildFRem")
+  (register build-frem
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildFRem")
   (doc build-neg "Emit `-val` (integer).")
-  (register build-neg (Fn [LLVMBuilder LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildNeg")
+  (register build-neg
+    (Fn [LLVMBuilder LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildNeg")
   (doc build-fneg "Emit `-val` (floating point).")
-  (register build-fneg (Fn [LLVMBuilder LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildFNeg")
+  (register build-fneg
+    (Fn [LLVMBuilder LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildFNeg")
   (doc build-not "Emit `~val`.")
-  (register build-not (Fn [LLVMBuilder LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildNot")
+  (register build-not
+    (Fn [LLVMBuilder LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildNot")
 
   ; --- casts (all `(val, dest-type, name)`) ---
   (doc build-trunc "Truncate an integer to a narrower type.")
-  (register build-trunc (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildTrunc")
+  (register build-trunc
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildTrunc")
   (doc build-zext "Zero-extend an integer to a wider type.")
-  (register build-zext (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildZExt")
+  (register build-zext
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildZExt")
   (doc build-sext "Sign-extend an integer to a wider type.")
-  (register build-sext (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildSExt")
+  (register build-sext
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildSExt")
   (doc build-fp-to-ui "Convert a float to an unsigned integer.")
-  (register build-fp-to-ui (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildFPToUI")
+  (register build-fp-to-ui
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildFPToUI")
   (doc build-fp-to-si "Convert a float to a signed integer.")
-  (register build-fp-to-si (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildFPToSI")
+  (register build-fp-to-si
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildFPToSI")
   (doc build-ui-to-fp "Convert an unsigned integer to a float.")
-  (register build-ui-to-fp (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildUIToFP")
+  (register build-ui-to-fp
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildUIToFP")
   (doc build-si-to-fp "Convert a signed integer to a float.")
-  (register build-si-to-fp (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildSIToFP")
+  (register build-si-to-fp
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildSIToFP")
   (doc build-fp-trunc "Truncate a float to a narrower float type.")
-  (register build-fp-trunc (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildFPTrunc")
+  (register build-fp-trunc
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildFPTrunc")
   (doc build-fp-ext "Extend a float to a wider float type.")
-  (register build-fp-ext (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildFPExt")
+  (register build-fp-ext
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildFPExt")
   (doc build-ptr-to-int "Cast a pointer to an integer.")
-  (register build-ptr-to-int (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildPtrToInt")
+  (register build-ptr-to-int
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildPtrToInt")
   (doc build-int-to-ptr "Cast an integer to a pointer.")
-  (register build-int-to-ptr (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildIntToPtr")
+  (register build-int-to-ptr
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildIntToPtr")
   (doc build-bit-cast "Reinterpret a value as another type of the same size.")
-  (register build-bit-cast (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue) "LLVMBuildBitCast")
+  (register build-bit-cast
+    (Fn [LLVMBuilder LLVMValue LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMBuildBitCast")
 
   ; --- floating-point comparison ---
-  (doc real-oeq "fcmp predicate: ordered equal.")           (register real-oeq Int "LLVMRealOEQ")
-  (doc real-ogt "fcmp predicate: ordered >.")               (register real-ogt Int "LLVMRealOGT")
-  (doc real-oge "fcmp predicate: ordered >=.")              (register real-oge Int "LLVMRealOGE")
-  (doc real-olt "fcmp predicate: ordered <.")               (register real-olt Int "LLVMRealOLT")
-  (doc real-ole "fcmp predicate: ordered <=.")              (register real-ole Int "LLVMRealOLE")
-  (doc real-one "fcmp predicate: ordered not equal.")       (register real-one Int "LLVMRealONE")
-  (doc real-ueq "fcmp predicate: unordered or equal.")      (register real-ueq Int "LLVMRealUEQ")
-  (doc real-une "fcmp predicate: unordered or not equal.")  (register real-une Int "LLVMRealUNE")
-  (doc build-fcmp "Emit a floating-point comparison with one of the `real-*` predicates.")
-  (register build-fcmp (Fn [LLVMBuilder Int LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildFCmp")
+  (doc real-oeq "fcmp predicate: ordered equal.")
+  (register real-oeq Int "LLVMRealOEQ")
+  (doc real-ogt "fcmp predicate: ordered >.")
+  (register real-ogt Int "LLVMRealOGT")
+  (doc real-oge "fcmp predicate: ordered >=.")
+  (register real-oge Int "LLVMRealOGE")
+  (doc real-olt "fcmp predicate: ordered <.")
+  (register real-olt Int "LLVMRealOLT")
+  (doc real-ole "fcmp predicate: ordered <=.")
+  (register real-ole Int "LLVMRealOLE")
+  (doc real-one "fcmp predicate: ordered not equal.")
+  (register real-one Int "LLVMRealONE")
+  (doc real-ueq "fcmp predicate: unordered or equal.")
+  (register real-ueq Int "LLVMRealUEQ")
+  (doc real-une "fcmp predicate: unordered or not equal.")
+  (register real-une Int "LLVMRealUNE")
+  (doc build-fcmp
+    "Emit a floating-point comparison with one of the `real-*` predicates.")
+  (register build-fcmp
+    (Fn [LLVMBuilder Int LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildFCmp")
 
   ; --- select & switch ---
   (doc build-select "Emit `cond ? then : else`.")
-  (register build-select (Fn [LLVMBuilder LLVMValue LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildSelect")
-  (doc build-switch "Emit a switch on `val` with `else` as default, reserving `num-cases` slots.
+  (register build-select
+    (Fn [LLVMBuilder LLVMValue LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildSelect")
+  (doc build-switch
+    "Emit a switch on `val` with `else` as default, reserving `num-cases` slots.
 Add cases with `add-case`.")
-  (register build-switch (Fn [LLVMBuilder LLVMValue LLVMBasicBlock Int] LLVMValue) "LLVMBuildSwitch")
+  (register build-switch
+    (Fn [LLVMBuilder LLVMValue LLVMBasicBlock Int] LLVMValue)
+    "LLVMBuildSwitch")
   (doc add-case "Add a `(on-val -> dest)` case to a switch instruction.")
   (register add-case (Fn [LLVMValue LLVMValue LLVMBasicBlock] ()) "LLVMAddCase")
 
   ; --- getelementptr & aggregates ---
   (hidden build-gep-raw)
-  (register build-gep-raw (Fn [LLVMBuilder LLVMType LLVMValue (Ptr LLVMValue) Int (Ptr CChar)] LLVMValue) "LLVMBuildGEP2")
-  (doc build-gep "Emit a getelementptr into `ptr` (of pointee type `ty`) with `indices`.")
+  (register build-gep-raw
+    (Fn
+      [LLVMBuilder LLVMType LLVMValue (Ptr LLVMValue) Int (Ptr CChar)]
+      LLVMValue)
+    "LLVMBuildGEP2")
+  (doc build-gep
+    "Emit a getelementptr into `ptr` (of pointee type `ty`) with `indices`.")
   (defn build-gep [b ty ptr indices name]
     (build-gep-raw b ty ptr (raw indices) (Array.length indices) name))
-  (doc build-struct-gep "Emit a getelementptr to field `idx` of the struct `ty` behind `ptr`.")
-  (register build-struct-gep (Fn [LLVMBuilder LLVMType LLVMValue Int (Ptr CChar)] LLVMValue) "LLVMBuildStructGEP2")
+  (doc build-struct-gep
+    "Emit a getelementptr to field `idx` of the struct `ty` behind `ptr`.")
+  (register build-struct-gep
+    (Fn [LLVMBuilder LLVMType LLVMValue Int (Ptr CChar)] LLVMValue)
+    "LLVMBuildStructGEP2")
   (doc build-extract-value "Extract field `idx` from an aggregate value.")
-  (register build-extract-value (Fn [LLVMBuilder LLVMValue Int (Ptr CChar)] LLVMValue) "LLVMBuildExtractValue")
+  (register build-extract-value
+    (Fn [LLVMBuilder LLVMValue Int (Ptr CChar)] LLVMValue)
+    "LLVMBuildExtractValue")
   (doc build-insert-value "Insert `elt` into field `idx` of an aggregate value.")
-  (register build-insert-value (Fn [LLVMBuilder LLVMValue LLVMValue Int (Ptr CChar)] LLVMValue) "LLVMBuildInsertValue")
+  (register build-insert-value
+    (Fn [LLVMBuilder LLVMValue LLVMValue Int (Ptr CChar)] LLVMValue)
+    "LLVMBuildInsertValue")
 
   ; --- globals & named lookups ---
   (doc add-global "Declare a global variable `name` of type `ty` in `mod`.")
-  (register add-global (Fn [LLVMModule LLVMType (Ptr CChar)] LLVMValue) "LLVMAddGlobal")
+  (register add-global
+    (Fn [LLVMModule LLVMType (Ptr CChar)] LLVMValue)
+    "LLVMAddGlobal")
   (doc set-initializer "Set the constant initializer of a global variable.")
   (register set-initializer (Fn [LLVMValue LLVMValue] ()) "LLVMSetInitializer")
-  (doc set-global-constant "Mark a global variable as constant (1) or mutable (0).")
+  (doc set-global-constant
+    "Mark a global variable as constant (1) or mutable (0).")
   (register set-global-constant (Fn [LLVMValue Int] ()) "LLVMSetGlobalConstant")
-  (doc get-named-global "Look up a global variable by name (may be a null handle).")
-  (register get-named-global (Fn [LLVMModule (Ptr CChar)] LLVMValue) "LLVMGetNamedGlobal")
-  (doc value-null? "Whether a value handle is null (e.g. a failed named lookup).")
-  (deftemplate value-null? (Fn [LLVMValue] Bool)
-    "bool $NAME(LLVMValueRef v)" "$DECL { return v == NULL; }")
-  (doc get-named-function "Look up a declared function by name (may be a null handle).")
-  (register get-named-function (Fn [LLVMModule (Ptr CChar)] LLVMValue) "LLVMGetNamedFunction")
-  (doc build-global-string-ptr "Intern `str` as a private global and yield an i8* to it.")
-  (register build-global-string-ptr (Fn [LLVMBuilder (Ptr CChar) (Ptr CChar)] LLVMValue) "LLVMBuildGlobalStringPtr")
+  (doc get-named-global
+    "Look up a global variable by name (may be a null handle).")
+  (register get-named-global
+    (Fn [LLVMModule (Ptr CChar)] LLVMValue)
+    "LLVMGetNamedGlobal")
+  (doc value-null?
+    "Whether a value handle is null (e.g. a failed named lookup).")
+  (deftemplate value-null?
+               (Fn [LLVMValue] Bool)
+               "bool $NAME(LLVMValueRef v)"
+               "$DECL { return v == NULL; }")
+  (doc get-named-function
+    "Look up a declared function by name (may be a null handle).")
+  (register get-named-function
+    (Fn [LLVMModule (Ptr CChar)] LLVMValue)
+    "LLVMGetNamedFunction")
+  (doc build-global-string-ptr
+    "Intern `str` as a private global and yield an i8* to it.")
+  (register build-global-string-ptr
+    (Fn [LLVMBuilder (Ptr CChar) (Ptr CChar)] LLVMValue)
+    "LLVMBuildGlobalStringPtr")
 
   ; linkage (for set-linkage)
-  (doc linkage-external "External linkage (the default for defined functions/globals).")
+  (doc linkage-external
+    "External linkage (the default for defined functions/globals).")
   (register linkage-external Int "LLVMExternalLinkage")
   (doc linkage-internal "Internal linkage (static, module-private).")
   (register linkage-internal Int "LLVMInternalLinkage")
   (doc linkage-private "Private linkage (not in the symbol table).")
   (register linkage-private Int "LLVMPrivateLinkage")
-  (doc set-linkage "Set the linkage of a function or global with a `linkage-*` value.")
+  (doc set-linkage
+    "Set the linkage of a function or global with a `linkage-*` value.")
   (register set-linkage (Fn [LLVMValue Int] ()) "LLVMSetLinkage")
 
   ; --- verification ---
-  (doc verify-module "Verify a module. Returns \"\" if valid, else the error String.")
-  (deftemplate verify-module (Fn [LLVMModule] String)
-    "String $NAME(LLVMModuleRef m)"
-    "$DECL { char* err = NULL; LLVMBool bad = LLVMVerifyModule(m, LLVMReturnStatusAction, &err); char* out = strdup((bad && err) ? err : \"\"); if (err) LLVMDisposeMessage(err); return out; }")
+  (doc verify-module
+    "Verify a module. Returns \"\" if valid, else the error String.")
+  (deftemplate verify-module
+               (Fn [LLVMModule] String)
+               "String $NAME(LLVMModuleRef m)"
+               "$DECL { char* err = NULL; LLVMBool bad = LLVMVerifyModule(m, LLVMReturnStatusAction, &err); char* out = strdup((bad && err) ? err : \"\"); if (err) LLVMDisposeMessage(err); return out; }")
 
   ; --- JIT (MCJIT) ---
-  (doc link-in-mcjit "Pull the MCJIT engine into the link. Call once before creating an engine.")
+  (doc link-in-mcjit
+    "Pull the MCJIT engine into the link. Call once before creating an engine.")
   (register link-in-mcjit (Fn [] ()) "LLVMLinkInMCJIT")
 
-  (doc initialize-native-target "Initialize codegen for the host target. Returns 0 on success.")
-  (deftemplate initialize-native-target (Fn [] Int)
-    "int $NAME()"
-    "$DECL { return LLVMInitializeNativeTarget(); }")
-  (doc initialize-native-asm-printer "Initialize the host asm printer. Returns 0 on success.")
-  (deftemplate initialize-native-asm-printer (Fn [] Int)
-    "int $NAME()"
-    "$DECL { return LLVMInitializeNativeAsmPrinter(); }")
+  (doc initialize-native-target
+    "Initialize codegen for the host target. Returns 0 on success.")
+  (deftemplate initialize-native-target
+               (Fn [] Int)
+               "int $NAME()"
+               "$DECL { return LLVMInitializeNativeTarget(); }")
+  (doc initialize-native-asm-printer
+    "Initialize the host asm printer. Returns 0 on success.")
+  (deftemplate initialize-native-asm-printer
+               (Fn [] Int)
+               "int $NAME()"
+               "$DECL { return LLVMInitializeNativeAsmPrinter(); }")
 
-  (doc create-execution-engine "Create an MCJIT engine that takes ownership of `mod`.
+  (doc create-execution-engine
+    "Create an MCJIT engine that takes ownership of `mod`.
 Returns a null handle on failure (check with `engine-null?`).")
-  (deftemplate create-execution-engine (Fn [LLVMModule] LLVMEngine)
-    "LLVMExecutionEngineRef $NAME(LLVMModuleRef m)"
-    "$DECL { LLVMExecutionEngineRef ee = NULL; char* err = NULL; if (LLVMCreateExecutionEngineForModule(&ee, m, &err)) { if (err) LLVMDisposeMessage(err); return NULL; } return ee; }")
+  (deftemplate create-execution-engine
+               (Fn [LLVMModule] LLVMEngine)
+               "LLVMExecutionEngineRef $NAME(LLVMModuleRef m)"
+               "$DECL { LLVMExecutionEngineRef ee = NULL; char* err = NULL; if (LLVMCreateExecutionEngineForModule(&ee, m, &err)) { if (err) LLVMDisposeMessage(err); return NULL; } return ee; }")
   (doc engine-null? "Whether engine creation failed.")
-  (deftemplate engine-null? (Fn [LLVMEngine] Bool)
-    "bool $NAME(LLVMExecutionEngineRef e)"
-    "$DECL { return e == NULL; }")
+  (deftemplate engine-null?
+               (Fn [LLVMEngine] Bool)
+               "bool $NAME(LLVMExecutionEngineRef e)"
+               "$DECL { return e == NULL; }")
   (doc engine-dispose "Free an execution engine (and the module it owns).")
   (register engine-dispose (Fn [LLVMEngine] ()) "LLVMDisposeExecutionEngine")
-  (doc function-address "Address of JIT-compiled function `name` as a Long, or 0 if absent.")
-  (register function-address (Fn [LLVMEngine (Ptr CChar)] Long) "LLVMGetFunctionAddress")
+  (doc function-address
+    "Address of JIT-compiled function `name` as a Long, or 0 if absent.")
+  (register function-address
+    (Fn [LLVMEngine (Ptr CChar)] Long)
+    "LLVMGetFunctionAddress")
 
   (doc call-i32 "Call a JIT'd `()->i32` function at `addr`.")
-  (deftemplate call-i32 (Fn [Long] Int)
-    "int $NAME(Long addr)"
-    "$DECL { typedef int(*fn_t)(void); return ((fn_t)(intptr_t)addr)(); }")
+  (deftemplate call-i32
+               (Fn [Long] Int)
+               "int $NAME(Long addr)"
+               "$DECL { typedef int(*fn_t)(void); return ((fn_t)(intptr_t)addr)(); }")
   (doc call-i32-i32 "Call a JIT'd `(i32)->i32` function at `addr` with `a`.")
-  (deftemplate call-i32-i32 (Fn [Long Int] Int)
-    "int $NAME(Long addr, int a)"
-    "$DECL { typedef int(*fn_t)(int); return ((fn_t)(intptr_t)addr)(a); }")
-  (doc call-i32-i32-i32 "Call a JIT'd `(i32,i32)->i32` function at `addr` with `a` and `b`.")
-  (deftemplate call-i32-i32-i32 (Fn [Long Int Int] Int)
-    "int $NAME(Long addr, int a, int b)"
-    "$DECL { typedef int(*fn_t)(int,int); return ((fn_t)(intptr_t)addr)(a, b); }")
-  (doc call-i32-i32-i32-i32 "Call a JIT'd `(i32,i32,i32)->i32` function at `addr` with `a`, `b`, and `c`.")
-  (deftemplate call-i32-i32-i32-i32 (Fn [Long Int Int Int] Int)
-    "int $NAME(Long addr, int a, int b, int c)"
-    "$DECL { typedef int(*fn_t)(int,int,int); return ((fn_t)(intptr_t)addr)(a, b, c); }")
+  (deftemplate call-i32-i32
+               (Fn [Long Int] Int)
+               "int $NAME(Long addr, int a)"
+               "$DECL { typedef int(*fn_t)(int); return ((fn_t)(intptr_t)addr)(a); }")
+  (doc call-i32-i32-i32
+    "Call a JIT'd `(i32,i32)->i32` function at `addr` with `a` and `b`.")
+  (deftemplate call-i32-i32-i32
+               (Fn [Long Int Int] Int)
+               "int $NAME(Long addr, int a, int b)"
+               "$DECL { typedef int(*fn_t)(int,int); return ((fn_t)(intptr_t)addr)(a, b); }")
+  (doc call-i32-i32-i32-i32
+    "Call a JIT'd `(i32,i32,i32)->i32` function at `addr` with `a`, `b`, and `c`.")
+  (deftemplate call-i32-i32-i32-i32
+               (Fn [Long Int Int Int] Int)
+               "int $NAME(Long addr, int a, int b, int c)"
+               "$DECL { typedef int(*fn_t)(int,int,int); return ((fn_t)(intptr_t)addr)(a, b, c); }")
+  (doc call-f32-f32 "Call a JIT'd `(float)->float` function at `addr` with `a`.")
+  (deftemplate call-f32-f32
+               (Fn [Long Float] Float)
+               "float $NAME(Long addr, float a)"
+               "$DECL { typedef float(*fn_t)(float); return ((fn_t)(intptr_t)addr)(a); }")
+
+  ; --- persistent JIT (ORC LLJIT) ---
+  (doc orc-create-lljit "Create a host LLJIT, or a null handle on failure.")
+  (deftemplate orc-create-lljit
+               (Fn [] LLVMOrcLLJIT)
+               "LLVMOrcLLJITRef $NAME(void)"
+               "$DECL { LLVMOrcLLJITRef jit = NULL; LLVMErrorRef err = LLVMOrcCreateLLJIT(&jit, NULL); if (err) { LLVMConsumeError(err); return NULL; } return jit; }")
+  (doc orc-lljit-null? "Whether LLJIT creation failed.")
+  (deftemplate orc-lljit-null?
+               (Fn [LLVMOrcLLJIT] Bool)
+               "bool $NAME(LLVMOrcLLJITRef jit)"
+               "$DECL { return jit == NULL; }")
+  (doc orc-dispose-lljit "Dispose a persistent LLJIT and all code it owns.")
+  (deftemplate orc-dispose-lljit
+               (Fn [LLVMOrcLLJIT] ())
+               "void $NAME(LLVMOrcLLJITRef jit)"
+               "$DECL { LLVMErrorRef err = LLVMOrcDisposeLLJIT(jit); if (err) LLVMConsumeError(err); }")
+  (doc orc-main-dylib "The main JITDylib owned by `jit`.")
+  (register orc-main-dylib
+    (Fn [LLVMOrcLLJIT] LLVMOrcJITDylib)
+    "LLVMOrcLLJITGetMainJITDylib")
+  (doc orc-clear-dylib "Remove every resource published in a JITDylib.
+Returns an error string; the LLJIT and its shared context remain alive.")
+  (deftemplate orc-clear-dylib
+               (Fn [LLVMOrcJITDylib] String)
+               "String $NAME(LLVMOrcJITDylibRef dylib)"
+               "$DECL { LLVMErrorRef err = LLVMOrcJITDylibClear(dylib); if (!err) return strdup(\"\"); char* msg = LLVMGetErrorMessage(err); char* out = strdup(msg); LLVMDisposeErrorMessage(msg); return out; }")
+  (doc orc-enable-process-symbols "Make symbols from the current process and
+RTLD_GLOBAL libraries visible to JIT modules. Returns an error string.")
+  (deftemplate orc-enable-process-symbols
+               (Fn [LLVMOrcLLJIT] String)
+               "String $NAME(LLVMOrcLLJITRef jit)"
+               "$DECL { LLVMOrcDefinitionGeneratorRef gen = NULL; LLVMErrorRef err = LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(&gen, LLVMOrcLLJITGetGlobalPrefix(jit), NULL, NULL); if (err) { char* msg = LLVMGetErrorMessage(err); char* out = strdup(msg); LLVMDisposeErrorMessage(msg); return out; } LLVMOrcJITDylibAddGenerator(LLVMOrcLLJITGetMainJITDylib(jit), gen); return strdup(\"\"); }")
+  (doc orc-thread-safe-context "Transfer `ctx` into a shared ORC context.
+Do not dispose `ctx` separately after this call.")
+  (register orc-thread-safe-context
+    (Fn [LLVMContext] LLVMOrcThreadSafeContext)
+    "LLVMOrcCreateNewThreadSafeContextFromLLVMContext")
+  (doc orc-dispose-thread-safe-context
+    "Release the caller's shared-context reference.")
+  (register orc-dispose-thread-safe-context
+    (Fn [LLVMOrcThreadSafeContext] ())
+    "LLVMOrcDisposeThreadSafeContext")
+  (doc orc-thread-safe-module "Wrap `mod` in the shared context and transfer
+module ownership to the wrapper.")
+  (register orc-thread-safe-module
+    (Fn [LLVMModule LLVMOrcThreadSafeContext] LLVMOrcThreadSafeModule)
+    "LLVMOrcCreateNewThreadSafeModule")
+  (doc orc-add-module "Add a thread-safe module to the persistent JIT. The JIT
+takes ownership when called, including on failure. Returns an error string.")
+  (deftemplate orc-add-module
+               (Fn [LLVMOrcLLJIT LLVMOrcJITDylib LLVMOrcThreadSafeModule] String)
+               "String $NAME(LLVMOrcLLJITRef jit, LLVMOrcJITDylibRef dylib, LLVMOrcThreadSafeModuleRef module)"
+               "$DECL { LLVMErrorRef err = LLVMOrcLLJITAddLLVMIRModule(jit, dylib, module); if (!err) return strdup(\"\"); char* msg = LLVMGetErrorMessage(err); char* out = strdup(msg); LLVMDisposeErrorMessage(msg); return out; }")
+  (doc orc-resource-tracker "Create a resource tracker for one incremental
+module. Release the caller's reference after publishing or removing it.")
+  (register orc-resource-tracker
+    (Fn [LLVMOrcJITDylib] LLVMOrcResourceTracker)
+    "LLVMOrcJITDylibCreateResourceTracker")
+  (doc orc-release-resource-tracker
+    "Release the caller's resource-tracker reference.")
+  (register orc-release-resource-tracker
+    (Fn [LLVMOrcResourceTracker] ())
+    "LLVMOrcReleaseResourceTracker")
+  (doc orc-remove-resources
+    "Remove every JIT resource associated with a tracker.")
+  (deftemplate orc-remove-resources
+               (Fn [LLVMOrcResourceTracker] String)
+               "String $NAME(LLVMOrcResourceTrackerRef tracker)"
+               "$DECL { LLVMErrorRef err = LLVMOrcResourceTrackerRemove(tracker); if (!err) return strdup(\"\"); char* msg = LLVMGetErrorMessage(err); char* out = strdup(msg); LLVMDisposeErrorMessage(msg); return out; }")
+  (doc orc-add-module-tracked "Add a thread-safe module under `tracker`. ORC
+takes module ownership when called, including on failure.")
+  (deftemplate orc-add-module-tracked
+               (Fn
+                 [LLVMOrcLLJIT LLVMOrcResourceTracker LLVMOrcThreadSafeModule]
+                 String)
+               "String $NAME(LLVMOrcLLJITRef jit, LLVMOrcResourceTrackerRef tracker, LLVMOrcThreadSafeModuleRef module)"
+               "$DECL { LLVMErrorRef err = LLVMOrcLLJITAddLLVMIRModuleWithRT(jit, tracker, module); if (!err) return strdup(\"\"); char* msg = LLVMGetErrorMessage(err); char* out = strdup(msg); LLVMDisposeErrorMessage(msg); return out; }")
+  (doc orc-lookup "Look up a published symbol, returning its address or zero.")
+  (deftemplate orc-lookup
+               (Fn [LLVMOrcLLJIT (Ptr CChar)] Long)
+               "Long $NAME(LLVMOrcLLJITRef jit, const char* name)"
+               "$DECL { LLVMOrcExecutorAddress addr = 0; LLVMErrorRef err = LLVMOrcLLJITLookup(jit, &addr, name); if (err) { char* msg = LLVMGetErrorMessage(err); if (getenv(\"CARP_DEBUG_JIT\")) fprintf(stderr, \"orc lookup %s: %s\\n\", name, msg); LLVMDisposeErrorMessage(msg); return 0; } return (Long)addr; }")
 
   ; --- AOT: emit an object or assembly file for the host target ---
   ; Call initialize-native-target and initialize-native-asm-printer once first.
-  (doc default-target-triple "The host target triple (e.g. \"arm64-apple-darwin24.6.0\").")
-  (deftemplate default-target-triple (Fn [] String)
-    "String $NAME()"
-    "$DECL { char* t = LLVMGetDefaultTargetTriple(); char* out = strdup(t); LLVMDisposeMessage(t); return out; }")
-  (doc target-from-triple "Look up the target for a triple. Null handle on failure (see `target-null?`).")
-  (deftemplate target-from-triple (Fn [(Ptr CChar)] LLVMTarget)
-    "LLVMTargetRef $NAME(const char* triple)"
-    "$DECL { LLVMTargetRef t = NULL; char* err = NULL; if (LLVMGetTargetFromTriple(triple, &t, &err)) { if (err) LLVMDisposeMessage(err); return NULL; } return t; }")
+  (doc default-target-triple
+    "The host target triple (e.g. \"arm64-apple-darwin24.6.0\").")
+  (deftemplate default-target-triple
+               (Fn [] String)
+               "String $NAME()"
+               "$DECL { char* t = LLVMGetDefaultTargetTriple(); char* out = strdup(t); LLVMDisposeMessage(t); return out; }")
+  (doc target-from-triple
+    "Look up the target for a triple. Null handle on failure (see `target-null?`).")
+  (deftemplate target-from-triple
+               (Fn [(Ptr CChar)] LLVMTarget)
+               "LLVMTargetRef $NAME(const char* triple)"
+               "$DECL { LLVMTargetRef t = NULL; char* err = NULL; if (LLVMGetTargetFromTriple(triple, &t, &err)) { if (err) LLVMDisposeMessage(err); return NULL; } return t; }")
   (doc target-null? "Whether a target lookup failed.")
-  (deftemplate target-null? (Fn [LLVMTarget] Bool)
-    "bool $NAME(LLVMTargetRef t)" "$DECL { return t == NULL; }")
+  (deftemplate target-null?
+               (Fn [LLVMTarget] Bool)
+               "bool $NAME(LLVMTargetRef t)"
+               "$DECL { return t == NULL; }")
 
-  (doc codegen-level-none "Optimization level: -O0.")        (register codegen-level-none Int "LLVMCodeGenLevelNone")
-  (doc codegen-level-less "Optimization level: -O1.")        (register codegen-level-less Int "LLVMCodeGenLevelLess")
-  (doc codegen-level-default "Optimization level: -O2.")     (register codegen-level-default Int "LLVMCodeGenLevelDefault")
-  (doc codegen-level-aggressive "Optimization level: -O3.")  (register codegen-level-aggressive Int "LLVMCodeGenLevelAggressive")
-  (doc reloc-default "Relocation model: target default.")    (register reloc-default Int "LLVMRelocDefault")
-  (doc reloc-pic "Relocation model: position-independent.")  (register reloc-pic Int "LLVMRelocPIC")
-  (doc reloc-static "Relocation model: static.")             (register reloc-static Int "LLVMRelocStatic")
-  (doc codemodel-default "Code model: target default.")      (register codemodel-default Int "LLVMCodeModelDefault")
-  (doc codemodel-small "Code model: small.")                 (register codemodel-small Int "LLVMCodeModelSmall")
-  (doc filetype-object "Emit an object file.")               (register filetype-object Int "LLVMObjectFile")
-  (doc filetype-assembly "Emit a textual assembly file.")    (register filetype-assembly Int "LLVMAssemblyFile")
+  (doc codegen-level-none "Optimization level: -O0.")
+  (register codegen-level-none Int "LLVMCodeGenLevelNone")
+  (doc codegen-level-less "Optimization level: -O1.")
+  (register codegen-level-less Int "LLVMCodeGenLevelLess")
+  (doc codegen-level-default "Optimization level: -O2.")
+  (register codegen-level-default Int "LLVMCodeGenLevelDefault")
+  (doc codegen-level-aggressive "Optimization level: -O3.")
+  (register codegen-level-aggressive Int "LLVMCodeGenLevelAggressive")
+  (doc reloc-default "Relocation model: target default.")
+  (register reloc-default Int "LLVMRelocDefault")
+  (doc reloc-pic "Relocation model: position-independent.")
+  (register reloc-pic Int "LLVMRelocPIC")
+  (doc reloc-static "Relocation model: static.")
+  (register reloc-static Int "LLVMRelocStatic")
+  (doc codemodel-default "Code model: target default.")
+  (register codemodel-default Int "LLVMCodeModelDefault")
+  (doc codemodel-small "Code model: small.")
+  (register codemodel-small Int "LLVMCodeModelSmall")
+  (doc filetype-object "Emit an object file.")
+  (register filetype-object Int "LLVMObjectFile")
+  (doc filetype-assembly "Emit a textual assembly file.")
+  (register filetype-assembly Int "LLVMAssemblyFile")
 
-  (doc create-target-machine "Create a target machine. `cpu`/`features` may be empty C strings;
+  (doc create-target-machine
+    "Create a target machine. `cpu`/`features` may be empty C strings;
 `level`/`reloc`/`codemodel` take the `codegen-level-*`/`reloc-*`/`codemodel-*` values.")
   (register create-target-machine
-    (Fn [LLVMTarget (Ptr CChar) (Ptr CChar) (Ptr CChar) Int Int Int] LLVMTargetMachine)
+    (Fn
+      [LLVMTarget (Ptr CChar) (Ptr CChar) (Ptr CChar) Int Int Int]
+      LLVMTargetMachine)
     "LLVMCreateTargetMachine")
   (doc dispose-target-machine "Free a target machine.")
-  (register dispose-target-machine (Fn [LLVMTargetMachine] ()) "LLVMDisposeTargetMachine")
-  (doc emit-to-file "Emit `mod` to `path` as `filetype-object`/`filetype-assembly`.
+  (register dispose-target-machine
+    (Fn [LLVMTargetMachine] ())
+    "LLVMDisposeTargetMachine")
+  (doc emit-to-file
+    "Emit `mod` to `path` as `filetype-object`/`filetype-assembly`.
 Returns \"\" on success or an error String.")
-  (deftemplate emit-to-file (Fn [LLVMTargetMachine LLVMModule (Ptr CChar) Int] String)
-    "String $NAME(LLVMTargetMachineRef tm, LLVMModuleRef m, const char* path, int ft)"
-    "$DECL { char* err = NULL; LLVMBool bad = LLVMTargetMachineEmitToFile(tm, m, path, (LLVMCodeGenFileType)ft, &err); char* out = strdup((bad && err) ? err : \"\"); if (err) LLVMDisposeMessage(err); return out; }")
+  (deftemplate emit-to-file
+               (Fn [LLVMTargetMachine LLVMModule (Ptr CChar) Int] String)
+               "String $NAME(LLVMTargetMachineRef tm, LLVMModuleRef m, const char* path, int ft)"
+               "$DECL { char* err = NULL; LLVMBool bad = LLVMTargetMachineEmitToFile(tm, m, path, (LLVMCodeGenFileType)ft, &err); char* out = strdup((bad && err) ? err : \"\"); if (err) LLVMDisposeMessage(err); return out; }")
 
   ; --- target data layout ---
   (doc set-target "Set the module's target triple.")
   (register set-target (Fn [LLVMModule (Ptr CChar)] ()) "LLVMSetTarget")
   (doc create-target-data-layout "The data layout of a target machine.
 Dispose with `dispose-target-data`; independent of the machine's lifetime.")
-  (register create-target-data-layout (Fn [LLVMTargetMachine] LLVMTargetData) "LLVMCreateTargetDataLayout")
+  (register create-target-data-layout
+    (Fn [LLVMTargetMachine] LLVMTargetData)
+    "LLVMCreateTargetDataLayout")
   (doc set-module-data-layout "Attach a data layout to a module.")
-  (register set-module-data-layout (Fn [LLVMModule LLVMTargetData] ()) "LLVMSetModuleDataLayout")
+  (register set-module-data-layout
+    (Fn [LLVMModule LLVMTargetData] ())
+    "LLVMSetModuleDataLayout")
   (doc dispose-target-data "Free a target data layout.")
   (register dispose-target-data (Fn [LLVMTargetData] ()) "LLVMDisposeTargetData")
   (doc abi-size-of-type "ABI size of `ty` in bytes.")
-  (register abi-size-of-type (Fn [LLVMTargetData LLVMType] Long) "LLVMABISizeOfType")
+  (register abi-size-of-type
+    (Fn [LLVMTargetData LLVMType] Long)
+    "LLVMABISizeOfType")
   (doc abi-alignment-of-type "ABI alignment of `ty` in bytes.")
-  (register abi-alignment-of-type (Fn [LLVMTargetData LLVMType] Int) "LLVMABIAlignmentOfType")
-  (doc offset-of-element "Byte offset of struct element `idx` under a data layout.")
-  (register offset-of-element (Fn [LLVMTargetData LLVMType Int] Long) "LLVMOffsetOfElement")
+  (register abi-alignment-of-type
+    (Fn [LLVMTargetData LLVMType] Int)
+    "LLVMABIAlignmentOfType")
+  (doc offset-of-element
+    "Byte offset of struct element `idx` under a data layout.")
+  (register offset-of-element
+    (Fn [LLVMTargetData LLVMType Int] Long)
+    "LLVMOffsetOfElement")
 
   ; --- optimization passes (new pass-manager) ---
-  (doc pass-options-create "Create pass-builder options. Dispose with `pass-options-dispose`.")
-  (register pass-options-create (Fn [] LLVMPassBuilderOptions) "LLVMCreatePassBuilderOptions")
+  (doc pass-options-create
+    "Create pass-builder options. Dispose with `pass-options-dispose`.")
+  (register pass-options-create
+    (Fn [] LLVMPassBuilderOptions)
+    "LLVMCreatePassBuilderOptions")
   (doc pass-options-dispose "Free pass-builder options.")
-  (register pass-options-dispose (Fn [LLVMPassBuilderOptions] ()) "LLVMDisposePassBuilderOptions")
-  (doc run-passes "Run a pass pipeline (e.g. \"default<O2>\", \"instcombine,mem2reg\") on `mod`.
+  (register pass-options-dispose
+    (Fn [LLVMPassBuilderOptions] ())
+    "LLVMDisposePassBuilderOptions")
+  (doc run-passes
+    "Run a pass pipeline (e.g. \"default<O2>\", \"instcombine,mem2reg\") on `mod`.
 Returns \"\" on success or an error String.")
-  (deftemplate run-passes (Fn [LLVMModule (Ptr CChar) LLVMTargetMachine LLVMPassBuilderOptions] String)
-    "String $NAME(LLVMModuleRef m, const char* passes, LLVMTargetMachineRef tm, LLVMPassBuilderOptionsRef o)"
-    "$DECL { LLVMErrorRef e = LLVMRunPasses(m, passes, tm, o); if (!e) return strdup(\"\"); char* msg = LLVMGetErrorMessage(e); char* out = strdup(msg); LLVMDisposeErrorMessage(msg); return out; }")
+  (deftemplate run-passes
+               (Fn
+                 [LLVMModule
+                  (Ptr CChar)
+                  LLVMTargetMachine
+                  LLVMPassBuilderOptions]
+                 String)
+               "String $NAME(LLVMModuleRef m, const char* passes, LLVMTargetMachineRef tm, LLVMPassBuilderOptionsRef o)"
+               "$DECL { LLVMErrorRef e = LLVMRunPasses(m, passes, tm, o); if (!e) return strdup(\"\"); char* msg = LLVMGetErrorMessage(e); char* out = strdup(msg); LLVMDisposeErrorMessage(msg); return out; }")
 
   ; --- vectors ---
   (doc vector-type "A fixed-width vector of `count` elements of type `elem`.")
   (register vector-type (Fn [LLVMType Int] LLVMType) "LLVMVectorType")
   (hidden const-vector-raw)
-  (register const-vector-raw (Fn [(Ptr LLVMValue) Int] LLVMValue) "LLVMConstVector")
+  (register const-vector-raw
+    (Fn [(Ptr LLVMValue) Int] LLVMValue)
+    "LLVMConstVector")
   (doc const-vector "A constant vector from the scalar constants `elems`.")
   (defn const-vector [elems] (const-vector-raw (raw elems) (Array.length elems)))
-  (doc build-extract-element "Extract the element at `idx` (a value) from a vector.")
-  (register build-extract-element (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildExtractElement")
+  (doc build-extract-element
+    "Extract the element at `idx` (a value) from a vector.")
+  (register build-extract-element
+    (Fn [LLVMBuilder LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildExtractElement")
   (doc build-insert-element "Insert `elt` at `idx` (a value) into a vector.")
-  (register build-insert-element (Fn [LLVMBuilder LLVMValue LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildInsertElement")
-  (doc build-shuffle-vector "Shuffle two vectors `v1`/`v2` by the constant `mask`.")
-  (register build-shuffle-vector (Fn [LLVMBuilder LLVMValue LLVMValue LLVMValue (Ptr CChar)] LLVMValue) "LLVMBuildShuffleVector")
+  (register build-insert-element
+    (Fn [LLVMBuilder LLVMValue LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildInsertElement")
+  (doc build-shuffle-vector
+    "Shuffle two vectors `v1`/`v2` by the constant `mask`.")
+  (register build-shuffle-vector
+    (Fn [LLVMBuilder LLVMValue LLVMValue LLVMValue (Ptr CChar)] LLVMValue)
+    "LLVMBuildShuffleVector")
 
   ; --- attributes ---
-  (doc attr-function-index "Attribute index for the function itself.")   (def attr-function-index -1)
-  (doc attr-return-index "Attribute index for the return value.")        (def attr-return-index 0)
-  (doc enum-attribute-kind "The numeric kind id for a named enum attribute (e.g. \"noinline\").")
-  (deftemplate enum-attribute-kind (Fn [(Ptr CChar)] Int)
-    "int $NAME(const char* name)" "$DECL { return LLVMGetEnumAttributeKindForName(name, strlen(name)); }")
-  (doc create-enum-attribute "Create an enum attribute of the given `kind` (see `enum-attribute-kind`).")
-  (register create-enum-attribute (Fn [LLVMContext Int Long] LLVMAttribute) "LLVMCreateEnumAttribute")
+  (doc attr-function-index "Attribute index for the function itself.")
+  (def attr-function-index -1)
+  (doc attr-return-index "Attribute index for the return value.")
+  (def attr-return-index 0)
+  (doc enum-attribute-kind
+    "The numeric kind id for a named enum attribute (e.g. \"noinline\").")
+  (deftemplate enum-attribute-kind
+               (Fn [(Ptr CChar)] Int)
+               "int $NAME(const char* name)"
+               "$DECL { return LLVMGetEnumAttributeKindForName(name, strlen(name)); }")
+  (doc create-enum-attribute
+    "Create an enum attribute of the given `kind` (see `enum-attribute-kind`).")
+  (register create-enum-attribute
+    (Fn [LLVMContext Int Long] LLVMAttribute)
+    "LLVMCreateEnumAttribute")
   (doc create-string-attribute "Create a string (key=value) attribute.")
-  (deftemplate create-string-attribute (Fn [LLVMContext (Ptr CChar) (Ptr CChar)] LLVMAttribute)
-    "LLVMAttributeRef $NAME(LLVMContextRef c, const char* k, const char* v)"
-    "$DECL { return LLVMCreateStringAttribute(c, k, strlen(k), v, strlen(v)); }")
-  (doc add-attribute "Attach an attribute to a function/callsite at `idx` (see `attr-*-index`).")
-  (register add-attribute (Fn [LLVMValue Int LLVMAttribute] ()) "LLVMAddAttributeAtIndex")
+  (deftemplate create-string-attribute
+               (Fn [LLVMContext (Ptr CChar) (Ptr CChar)] LLVMAttribute)
+               "LLVMAttributeRef $NAME(LLVMContextRef c, const char* k, const char* v)"
+               "$DECL { return LLVMCreateStringAttribute(c, k, strlen(k), v, strlen(v)); }")
+  (doc add-attribute
+    "Attach an attribute to a function/callsite at `idx` (see `attr-*-index`).")
+  (register add-attribute
+    (Fn [LLVMValue Int LLVMAttribute] ())
+    "LLVMAddAttributeAtIndex")
 
   ; --- metadata ---
   (doc md-string "Create a metadata string.")
-  (deftemplate md-string (Fn [LLVMContext (Ptr CChar)] LLVMMetadata)
-    "LLVMMetadataRef $NAME(LLVMContextRef c, const char* s)" "$DECL { return LLVMMDStringInContext2(c, s, strlen(s)); }")
+  (deftemplate md-string
+               (Fn [LLVMContext (Ptr CChar)] LLVMMetadata)
+               "LLVMMetadataRef $NAME(LLVMContextRef c, const char* s)"
+               "$DECL { return LLVMMDStringInContext2(c, s, strlen(s)); }")
   (hidden md-node-raw)
-  (register md-node-raw (Fn [LLVMContext (Ptr LLVMMetadata) Int] LLVMMetadata) "LLVMMDNodeInContext2")
+  (register md-node-raw
+    (Fn [LLVMContext (Ptr LLVMMetadata) Int] LLVMMetadata)
+    "LLVMMDNodeInContext2")
   (doc md-node "Create a metadata node (tuple) from `operands`.")
-  (defn md-node [ctx operands] (md-node-raw ctx (raw operands) (Array.length operands)))
-  (doc metadata-as-value "Wrap metadata as a value (for `set-metadata`/named metadata).")
-  (register metadata-as-value (Fn [LLVMContext LLVMMetadata] LLVMValue) "LLVMMetadataAsValue")
+  (defn md-node [ctx operands]
+    (md-node-raw ctx (raw operands) (Array.length operands)))
+  (doc metadata-as-value
+    "Wrap metadata as a value (for `set-metadata`/named metadata).")
+  (register metadata-as-value
+    (Fn [LLVMContext LLVMMetadata] LLVMValue)
+    "LLVMMetadataAsValue")
   (doc value-as-metadata "View a value (e.g. a constant) as metadata.")
-  (register value-as-metadata (Fn [LLVMValue] LLVMMetadata) "LLVMValueAsMetadata")
-  (doc add-named-metadata "Append a value to a named metadata node (e.g. \"llvm.ident\").")
-  (register add-named-metadata (Fn [LLVMModule (Ptr CChar) LLVMValue] ()) "LLVMAddNamedMetadataOperand")
-  (doc md-kind-id "Intern a metadata kind name (e.g. \"dbg\", \"tbaa\") to an id.")
-  (deftemplate md-kind-id (Fn [LLVMContext (Ptr CChar)] Int)
-    "int $NAME(LLVMContextRef c, const char* s)" "$DECL { return LLVMGetMDKindIDInContext(c, s, strlen(s)); }")
-  (doc set-metadata "Attach metadata `node` of kind `kind-id` to an instruction value.")
+  (register value-as-metadata
+    (Fn [LLVMValue] LLVMMetadata)
+    "LLVMValueAsMetadata")
+  (doc add-named-metadata
+    "Append a value to a named metadata node (e.g. \"llvm.ident\").")
+  (register add-named-metadata
+    (Fn [LLVMModule (Ptr CChar) LLVMValue] ())
+    "LLVMAddNamedMetadataOperand")
+  (doc md-kind-id
+    "Intern a metadata kind name (e.g. \"dbg\", \"tbaa\") to an id.")
+  (deftemplate md-kind-id
+               (Fn [LLVMContext (Ptr CChar)] Int)
+               "int $NAME(LLVMContextRef c, const char* s)"
+               "$DECL { return LLVMGetMDKindIDInContext(c, s, strlen(s)); }")
+  (doc set-metadata
+    "Attach metadata `node` of kind `kind-id` to an instruction value.")
   (register set-metadata (Fn [LLVMValue Int LLVMValue] ()) "LLVMSetMetadata")
-  (doc behavior-warning "Module-flag merge behavior: warn on conflict.")  (register behavior-warning Int "LLVMModuleFlagBehaviorWarning")
-  (doc behavior-error "Module-flag merge behavior: error on conflict.")   (register behavior-error Int "LLVMModuleFlagBehaviorError")
-  (doc add-module-flag "Add a module flag (key -> metadata) with a merge `behavior`.")
-  (deftemplate add-module-flag (Fn [LLVMModule Int (Ptr CChar) LLVMMetadata] ())
-    "void $NAME(LLVMModuleRef m, int b, const char* key, LLVMMetadataRef v)"
-    "$DECL { LLVMAddModuleFlag(m, (LLVMModuleFlagBehavior)b, key, strlen(key), v); }")
+  (doc behavior-warning "Module-flag merge behavior: warn on conflict.")
+  (register behavior-warning Int "LLVMModuleFlagBehaviorWarning")
+  (doc behavior-error "Module-flag merge behavior: error on conflict.")
+  (register behavior-error Int "LLVMModuleFlagBehaviorError")
+  (doc add-module-flag
+    "Add a module flag (key -> metadata) with a merge `behavior`.")
+  (deftemplate add-module-flag
+               (Fn [LLVMModule Int (Ptr CChar) LLVMMetadata] ())
+               "void $NAME(LLVMModuleRef m, int b, const char* key, LLVMMetadataRef v)"
+               "$DECL { LLVMAddModuleFlag(m, (LLVMModuleFlagBehavior)b, key, strlen(key), v); }")
 
   ; --- bitcode & IR text I/O ---
-  (doc write-bitcode-to-file "Write module bitcode to `path`. Returns 0 on success.")
-  (register write-bitcode-to-file (Fn [LLVMModule (Ptr CChar)] Int) "LLVMWriteBitcodeToFile")
-  (doc memory-buffer-of-file "Read a file into a memory buffer, or a null handle on error.")
-  (deftemplate memory-buffer-of-file (Fn [(Ptr CChar)] LLVMMemoryBuffer)
-    "LLVMMemoryBufferRef $NAME(const char* path)"
-    "$DECL { LLVMMemoryBufferRef b = NULL; char* err = NULL; if (LLVMCreateMemoryBufferWithContentsOfFile(path, &b, &err)) { if (err) LLVMDisposeMessage(err); return NULL; } return b; }")
+  (doc write-bitcode-to-file
+    "Write module bitcode to `path`. Returns 0 on success.")
+  (register write-bitcode-to-file
+    (Fn [LLVMModule (Ptr CChar)] Int)
+    "LLVMWriteBitcodeToFile")
+  (doc memory-buffer-of-file
+    "Read a file into a memory buffer, or a null handle on error.")
+  (deftemplate memory-buffer-of-file
+               (Fn [(Ptr CChar)] LLVMMemoryBuffer)
+               "LLVMMemoryBufferRef $NAME(const char* path)"
+               "$DECL { LLVMMemoryBufferRef b = NULL; char* err = NULL; if (LLVMCreateMemoryBufferWithContentsOfFile(path, &b, &err)) { if (err) LLVMDisposeMessage(err); return NULL; } return b; }")
   (doc memory-buffer-null? "Whether a memory-buffer read failed.")
-  (deftemplate memory-buffer-null? (Fn [LLVMMemoryBuffer] Bool)
-    "bool $NAME(LLVMMemoryBufferRef b)" "$DECL { return b == NULL; }")
-  (doc parse-ir "Parse textual IR or bitcode in `buf` into a module (consumes `buf`).
+  (deftemplate memory-buffer-null?
+               (Fn [LLVMMemoryBuffer] Bool)
+               "bool $NAME(LLVMMemoryBufferRef b)"
+               "$DECL { return b == NULL; }")
+  (doc parse-ir
+    "Parse textual IR or bitcode in `buf` into a module (consumes `buf`).
 Returns a null-module handle on error; check with `module-null?`.")
-  (deftemplate parse-ir (Fn [LLVMContext LLVMMemoryBuffer] LLVMModule)
-    "LLVMModuleRef $NAME(LLVMContextRef c, LLVMMemoryBufferRef b)"
-    "$DECL { LLVMModuleRef m = NULL; char* err = NULL; if (LLVMParseIRInContext(c, b, &m, &err)) { if (err) LLVMDisposeMessage(err); return NULL; } return m; }")
+  (deftemplate parse-ir
+               (Fn [LLVMContext LLVMMemoryBuffer] LLVMModule)
+               "LLVMModuleRef $NAME(LLVMContextRef c, LLVMMemoryBufferRef b)"
+               "$DECL { LLVMModuleRef m = NULL; char* err = NULL; if (LLVMParseIRInContext(c, b, &m, &err)) { if (err) LLVMDisposeMessage(err); return NULL; } return m; }")
   (doc module-null? "Whether a module handle is null (e.g. a failed parse).")
-  (deftemplate module-null? (Fn [LLVMModule] Bool)
-    "bool $NAME(LLVMModuleRef m)" "$DECL { return m == NULL; }")
+  (deftemplate module-null?
+               (Fn [LLVMModule] Bool)
+               "bool $NAME(LLVMModuleRef m)"
+               "$DECL { return m == NULL; }")
 
   ; --- debug info (DWARF, via DIBuilder) ---
   ; DWARF type-encoding (DW_ATE_*) values, passed to di-basic-type.
-  (doc dwarf-signed "DWARF base-type encoding: signed integer.")     (def dwarf-signed 5)
-  (doc dwarf-unsigned "DWARF base-type encoding: unsigned integer.") (def dwarf-unsigned 7)
-  (doc dwarf-float "DWARF base-type encoding: floating point.")      (def dwarf-float 4)
-  (doc dwarf-boolean "DWARF base-type encoding: boolean.")           (def dwarf-boolean 2)
+  (doc dwarf-signed "DWARF base-type encoding: signed integer.")
+  (def dwarf-signed 5)
+  (doc dwarf-unsigned "DWARF base-type encoding: unsigned integer.")
+  (def dwarf-unsigned 7)
+  (doc dwarf-float "DWARF base-type encoding: floating point.")
+  (def dwarf-float 4)
+  (doc dwarf-boolean "DWARF base-type encoding: boolean.")
+  (def dwarf-boolean 2)
 
-  (doc di-builder-create "Create a debug-info builder for `mod`. Call `di-finalize` then
+  (doc di-builder-create
+    "Create a debug-info builder for `mod`. Call `di-finalize` then
 `di-builder-dispose` when done.")
-  (register di-builder-create (Fn [LLVMModule] LLVMDIBuilder) "LLVMCreateDIBuilder")
-  (doc di-finalize "Resolve all deferred debug-info nodes. Call before disposing.")
+  (register di-builder-create
+    (Fn [LLVMModule] LLVMDIBuilder)
+    "LLVMCreateDIBuilder")
+  (doc di-finalize
+    "Resolve all deferred debug-info nodes. Call before disposing.")
   (register di-finalize (Fn [LLVMDIBuilder] ()) "LLVMDIBuilderFinalize")
   (doc di-builder-dispose "Free a debug-info builder.")
   (register di-builder-dispose (Fn [LLVMDIBuilder] ()) "LLVMDisposeDIBuilder")
   (doc di-file "A debug-info file entry (`name`, `dir`).")
-  (deftemplate di-file (Fn [LLVMDIBuilder (Ptr CChar) (Ptr CChar)] LLVMMetadata)
-    "LLVMMetadataRef $NAME(LLVMDIBuilderRef b, const char* name, const char* dir)"
-    "$DECL { return LLVMDIBuilderCreateFile(b, name, strlen(name), dir, strlen(dir)); }")
-  (doc di-compile-unit "A C-language DWARF compile unit for `file` (defaults: unoptimized, full emission).")
-  (deftemplate di-compile-unit (Fn [LLVMDIBuilder LLVMMetadata (Ptr CChar)] LLVMMetadata)
-    "LLVMMetadataRef $NAME(LLVMDIBuilderRef b, LLVMMetadataRef file, const char* producer)"
-    "$DECL { return LLVMDIBuilderCreateCompileUnit(b, LLVMDWARFSourceLanguageC, file, producer, strlen(producer), 0, \"\", 0, 0, \"\", 0, LLVMDWARFEmissionFull, 0, 0, 0, \"\", 0, \"\", 0); }")
-  (doc di-basic-type "A DWARF base type (`name`, `size-in-bits`, a `dwarf-*` encoding).")
-  (deftemplate di-basic-type (Fn [LLVMDIBuilder (Ptr CChar) Long Int] LLVMMetadata)
-    "LLVMMetadataRef $NAME(LLVMDIBuilderRef b, const char* name, uint64_t bits, int enc)"
-    "$DECL { return LLVMDIBuilderCreateBasicType(b, name, strlen(name), bits, enc, LLVMDIFlagZero); }")
+  (deftemplate di-file
+               (Fn [LLVMDIBuilder (Ptr CChar) (Ptr CChar)] LLVMMetadata)
+               "LLVMMetadataRef $NAME(LLVMDIBuilderRef b, const char* name, const char* dir)"
+               "$DECL { return LLVMDIBuilderCreateFile(b, name, strlen(name), dir, strlen(dir)); }")
+  (doc di-compile-unit
+    "A C-language DWARF compile unit for `file` (defaults: unoptimized, full emission).")
+  (deftemplate di-compile-unit
+               (Fn [LLVMDIBuilder LLVMMetadata (Ptr CChar)] LLVMMetadata)
+               "LLVMMetadataRef $NAME(LLVMDIBuilderRef b, LLVMMetadataRef file, const char* producer)"
+               "$DECL { return LLVMDIBuilderCreateCompileUnit(b, LLVMDWARFSourceLanguageC, file, producer, strlen(producer), 0, \"\", 0, 0, \"\", 0, LLVMDWARFEmissionFull, 0, 0, 0, \"\", 0, \"\", 0); }")
+  (doc di-basic-type
+    "A DWARF base type (`name`, `size-in-bits`, a `dwarf-*` encoding).")
+  (deftemplate di-basic-type
+               (Fn [LLVMDIBuilder (Ptr CChar) Long Int] LLVMMetadata)
+               "LLVMMetadataRef $NAME(LLVMDIBuilderRef b, const char* name, uint64_t bits, int enc)"
+               "$DECL { return LLVMDIBuilderCreateBasicType(b, name, strlen(name), bits, enc, LLVMDIFlagZero); }")
   (hidden di-subroutine-type-raw)
-  (register di-subroutine-type-raw (Fn [LLVMDIBuilder LLVMMetadata (Ptr LLVMMetadata) Int Int] LLVMMetadata) "LLVMDIBuilderCreateSubroutineType")
-  (doc di-subroutine-type "A function-type descriptor. `param-types` is [return-type, arg-types...].")
+  (register di-subroutine-type-raw
+    (Fn [LLVMDIBuilder LLVMMetadata (Ptr LLVMMetadata) Int Int] LLVMMetadata)
+    "LLVMDIBuilderCreateSubroutineType")
+  (doc di-subroutine-type
+    "A function-type descriptor. `param-types` is [return-type, arg-types...].")
   (defn di-subroutine-type [b file param-types]
-    (di-subroutine-type-raw b file (raw param-types) (Array.length param-types) 0))
-  (doc di-function "A DWARF subprogram for a function (defaults: definition, not-local, unoptimized).")
-  (deftemplate di-function (Fn [LLVMDIBuilder LLVMMetadata (Ptr CChar) LLVMMetadata Int LLVMMetadata] LLVMMetadata)
-    "LLVMMetadataRef $NAME(LLVMDIBuilderRef b, LLVMMetadataRef scope, const char* name, LLVMMetadataRef file, int line, LLVMMetadataRef ty)"
-    "$DECL { return LLVMDIBuilderCreateFunction(b, scope, name, strlen(name), name, strlen(name), file, line, ty, 0, 1, line, LLVMDIFlagZero, 0); }")
+    (di-subroutine-type-raw b
+                            file
+                            (raw param-types)
+                            (Array.length param-types)
+                            0))
+  (doc di-function
+    "A DWARF subprogram for a function (defaults: definition, not-local, unoptimized).")
+  (deftemplate di-function
+               (Fn
+                 [LLVMDIBuilder
+                  LLVMMetadata
+                  (Ptr CChar)
+                  LLVMMetadata
+                  Int
+                  LLVMMetadata]
+                 LLVMMetadata)
+               "LLVMMetadataRef $NAME(LLVMDIBuilderRef b, LLVMMetadataRef scope, const char* name, LLVMMetadataRef file, int line, LLVMMetadataRef ty)"
+               "$DECL { return LLVMDIBuilderCreateFunction(b, scope, name, strlen(name), name, strlen(name), file, line, ty, 0, 1, line, LLVMDIFlagZero, 0); }")
   (doc set-subprogram "Attach a `di-function` subprogram to a function value.")
   (register set-subprogram (Fn [LLVMValue LLVMMetadata] ()) "LLVMSetSubprogram")
+  (doc di-lexical-block-file "A file-specific scope nested under a function
+scope, for synthesized functions whose instructions originate in many files.")
+  (register di-lexical-block-file
+    (Fn [LLVMDIBuilder LLVMMetadata LLVMMetadata Int] LLVMMetadata)
+    "LLVMDIBuilderCreateLexicalBlockFile")
   (doc debug-location "A source location (`line`, `col`) within `scope`.")
-  (deftemplate debug-location (Fn [LLVMContext Int Int LLVMMetadata] LLVMMetadata)
-    "LLVMMetadataRef $NAME(LLVMContextRef c, int line, int col, LLVMMetadataRef scope)"
-    "$DECL { return LLVMDIBuilderCreateDebugLocation(c, line, col, scope, NULL); }")
-  (doc set-debug-location "Set the builder's current debug location for emitted instructions.")
-  (register set-debug-location (Fn [LLVMBuilder LLVMMetadata] ()) "LLVMSetCurrentDebugLocation2")
-)
+  (deftemplate debug-location
+               (Fn [LLVMContext Int Int LLVMMetadata] LLVMMetadata)
+               "LLVMMetadataRef $NAME(LLVMContextRef c, int line, int col, LLVMMetadataRef scope)"
+               "$DECL { return LLVMDIBuilderCreateDebugLocation(c, line, col, scope, NULL); }")
+  (doc set-debug-location
+    "Set the builder's current debug location for emitted instructions.")
+  (register set-debug-location
+    (Fn [LLVMBuilder LLVMMetadata] ())
+    "LLVMSetCurrentDebugLocation2")
+  (doc clear-debug-location "Clear the builder's current debug location.")
+  (deftemplate clear-debug-location
+               (Fn [LLVMBuilder] ())
+               "void $NAME(LLVMBuilderRef b)"
+               "$DECL { LLVMSetCurrentDebugLocation2(b, NULL); }")
+  (doc instruction? "Whether an LLVM value is an instruction rather than a
+constant, function, global, or argument.")
+  (deftemplate instruction?
+               (Fn [LLVMValue] Bool)
+               "bool $NAME(LLVMValueRef v)"
+               "$DECL { return LLVMIsAInstruction(v) != NULL; }")
+  (doc set-instruction-debug-location "Attach a debug location directly to an
+instruction value.")
+  (register set-instruction-debug-location
+    (Fn [LLVMValue LLVMMetadata] ())
+    "LLVMInstructionSetDebugLoc"))
 
 (defmodule LLVMx
-  (doc with-context "Bind `name` to a fresh context, run `body`, then dispose it.")
+  (doc with-context
+    "Bind `name` to a fresh context, run `body`, then dispose it.")
   (defmacro with-context [name :rest body]
     (eval
       `(let-do [%name (LLVM.context-create)]
         %(cons 'do body)
         (LLVM.context-dispose %name))))
 
-  (doc with-builder "Bind `name` to a builder on `ctx`, run `body`, then dispose it.")
+  (doc with-builder
+    "Bind `name` to a builder on `ctx`, run `body`, then dispose it.")
   (defmacro with-builder [name ctx :rest body]
     (eval
       `(let-do [%name (LLVM.builder-create %ctx)]
         %(cons 'do body)
-        (LLVM.builder-dispose %name))))
-)
+        (LLVM.builder-dispose %name)))))

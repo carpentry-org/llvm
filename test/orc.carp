@@ -1,0 +1,121 @@
+(load "../llvm.carp")
+(load "Test.carp")
+
+(LLVM.setup)
+
+(use Test)
+(use LLVM)
+
+(defn cstr [s] (String.cstr s))
+
+(deftype OrcResult
+  [create-ok Bool
+   process-symbols String
+   tracked-add String
+   tracked-value Float
+   tracked-removed String
+   tracked-gone Bool
+   plain-add String
+   plain-value Float
+   clear String
+   plain-gone Bool])
+
+(defn unary-module [module-name function-name operation constant]
+  (let-do [ctx (context-create)
+           builder (builder-create ctx)
+           mod (module-create (cstr module-name) ctx)
+           fnty (function-type (float-type ctx) &[(float-type ctx)] false)
+           func (add-function mod (cstr function-name) fnty)
+           entry (append-block ctx func (cstr &@"entry"))]
+    (position-at-end builder entry)
+    (let [value (if (= operation 0)
+            (build-fmul builder
+                        (get-param func 0)
+                        (const-real (float-type ctx) constant)
+                        (cstr &@"result"))
+            (build-fadd builder
+                        (get-param func 0)
+                        (const-real (float-type ctx) constant)
+                        (cstr &@"result")))]
+      (ignore (build-ret builder value)))
+    (builder-dispose builder)
+    (let-do [shared (orc-thread-safe-context ctx)
+             wrapped (orc-thread-safe-module mod shared)]
+      (orc-dispose-thread-safe-context shared)
+      wrapped)))
+
+(defn exercise-orc []
+  (do
+    (ignore (initialize-native-target))
+    (ignore (initialize-native-asm-printer))
+    (let-do [jit (orc-create-lljit)
+             create-ok (not (orc-lljit-null? jit))]
+      (if (not create-ok)
+        (OrcResult.init false @"" @"" 0f @"" false @"" 0f @"" false)
+        (let-do [dylib (orc-main-dylib jit)
+                 process-symbols (orc-enable-process-symbols jit)
+                 tracker (orc-resource-tracker dylib)
+                 tracked-add (orc-add-module-tracked jit
+                                                     tracker
+                                                     (unary-module &@"tracked"
+                                                                   &@"gain"
+                                                                   0
+                                                                   0.5))
+                 gain-address (orc-lookup jit (cstr &@"gain"))
+                 tracked-value (call-f32-f32 gain-address 0.8f)
+                 tracked-removed (orc-remove-resources tracker)
+                 tracked-gone (= (orc-lookup jit (cstr &@"gain")) 0l)]
+          (orc-release-resource-tracker tracker)
+          (let-do [plain-add (orc-add-module jit
+                                             dylib
+                                             (unary-module &@"plain"
+                                                           &@"bias"
+                                                           1
+                                                           0.25))
+                   bias-address (orc-lookup jit (cstr &@"bias"))
+                   plain-value (call-f32-f32 bias-address 0.5f)
+                   clear (orc-clear-dylib dylib)
+                   plain-gone (= (orc-lookup jit (cstr &@"bias")) 0l)]
+            (orc-dispose-lljit jit)
+            (OrcResult.init create-ok
+                            process-symbols
+                            tracked-add
+                            tracked-value
+                            tracked-removed
+                            tracked-gone
+                            plain-add
+                            plain-value
+                            clear
+                            plain-gone)))))))
+
+(def result (exercise-orc))
+
+(deftest test
+  (assert-true test @(OrcResult.create-ok &result) "ORC LLJIT is created")
+  (assert-true test
+    (String.empty? (OrcResult.process-symbols &result))
+    "process symbols are made visible")
+  (assert-true test
+    (String.empty? (OrcResult.tracked-add &result))
+    "a tracked module is published")
+  (assert-true test
+    (Float.approx @(OrcResult.tracked-value &result) 0.4f)
+    "a tracked float function is callable")
+  (assert-true test
+    (String.empty? (OrcResult.tracked-removed &result))
+    "tracked resources are removed")
+  (assert-true test
+    @(OrcResult.tracked-gone &result)
+    "a removed tracked symbol is no longer visible")
+  (assert-true test
+    (String.empty? (OrcResult.plain-add &result))
+    "an untracked module is published")
+  (assert-true test
+    (Float.approx @(OrcResult.plain-value &result) 0.75f)
+    "an untracked float function is callable")
+  (assert-true test
+    (String.empty? (OrcResult.clear &result))
+    "the main JIT dylib is cleared")
+  (assert-true test
+    @(OrcResult.plain-gone &result)
+    "a symbol is no longer visible after clearing its dylib"))

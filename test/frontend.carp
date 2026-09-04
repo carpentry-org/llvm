@@ -20,7 +20,11 @@
 ;   }
 ;   const i32 magic = 7;
 
-(deftype Result [emit String jit-add Int jit-c0 Int jit-c1 Int jit-def Int])
+(deftype Result [emit String
+                 jit-add Int
+                 jit-c0 Int
+                 jit-c1 Int
+                 jit-def Int])
 
 (defn cstr [s] (String.cstr s))
 
@@ -32,8 +36,14 @@
            entry (append-block ctx func (cstr &@"entry"))]
     (position-at-end builder entry)
     (let-do [slot (build-alloca builder pair (cstr &@"p"))
-             tx (build-trunc builder (get-param func 0) (int32-type ctx) (cstr &@"tx"))
-             ty (build-trunc builder (get-param func 1) (int32-type ctx) (cstr &@"ty"))
+             tx (build-trunc builder
+                             (get-param func 0)
+                             (int32-type ctx)
+                             (cstr &@"tx"))
+             ty (build-trunc builder
+                             (get-param func 1)
+                             (int32-type ctx)
+                             (cstr &@"ty"))
              gx (build-struct-gep builder pair slot 0 (cstr &@"gx"))
              gy (build-struct-gep builder pair slot 1 (cstr &@"gy"))]
       (ignore (build-store builder tx gx))
@@ -60,7 +70,8 @@
     (ignore (build-ret builder (const-int (int32-type ctx) 20l 0)))
     (position-at-end builder dflt)
     (let-do [m (build-load builder (int32-type ctx) magic (cstr &@"m"))]
-      (ignore (build-ret builder (build-add builder (get-param func 0) m (cstr &@"r")))))))
+      (ignore
+        (build-ret builder (build-add builder (get-param func 0) m (cstr &@"r")))))))
 
 (defn lower []
   (let-do [ctx (context-create)
@@ -82,23 +93,30 @@
       (let-do [triple (default-target-triple)
                target (target-from-triple (cstr &triple))
                emit-err (if (target-null? target)
-                          @"no target for host triple"
-                          (let [tm (create-target-machine target (cstr &triple)
-                                     (cstr &@"") (cstr &@"")
-                                     codegen-level-default reloc-pic codemodel-default)]
-                            (let-do [e (emit-to-file tm mod (cstr &@"out/frontend.o") filetype-object)]
-                              (dispose-target-machine tm)
-                              e)))]
+                 @"no target for host triple"
+                 (let [tm (create-target-machine target
+                                                 (cstr &triple)
+                                                 (cstr &@"")
+                                                 (cstr &@"")
+                                                 codegen-level-default
+                                                 reloc-pic
+                                                 codemodel-default)]
+                   (let-do [e (emit-to-file tm
+                                            mod
+                                            (cstr &@"out/frontend.o")
+                                            filetype-object)]
+                     (dispose-target-machine tm)
+                     e)))]
         ; --- JIT the same module and call each function ---
         (link-in-mcjit)
         (let-do [engine (create-execution-engine mod)
                  add-addr (function-address engine (cstr &@"struct_add"))
                  cls-addr (function-address engine (cstr &@"classify"))
                  res (Result.init emit-err
-                       (call-i32-i32-i32 add-addr 20 22)
-                       (call-i32-i32 cls-addr 0)
-                       (call-i32-i32 cls-addr 1)
-                       (call-i32-i32 cls-addr 5))]
+                                  (call-i32-i32-i32 add-addr 20 22)
+                                  (call-i32-i32 cls-addr 0)
+                                  (call-i32-i32 cls-addr 1)
+                                  (call-i32-i32 cls-addr 5))]
           (engine-dispose engine)
           (builder-dispose builder)
           (context-dispose ctx)
@@ -107,13 +125,22 @@
 (def result (lower))
 
 (deftest test
-  (assert-true test (String.empty? (Result.emit &result))
+  (assert-true test
+    (String.empty? (Result.emit &result))
     "emit-to-file wrote a native object with no error")
-  (assert-equal test 42 @(Result.jit-add &result)
+  (assert-equal test
+    42
+    @(Result.jit-add &result)
     "struct_add(20, 22) == 42  (trunc + struct + gep + load/store)")
-  (assert-equal test 10 @(Result.jit-c0 &result)
+  (assert-equal test
+    10
+    @(Result.jit-c0 &result)
     "classify(0) == 10  (switch case)")
-  (assert-equal test 20 @(Result.jit-c1 &result)
+  (assert-equal test
+    20
+    @(Result.jit-c1 &result)
     "classify(1) == 20  (switch case)")
-  (assert-equal test 12 @(Result.jit-def &result)
+  (assert-equal test
+    12
+    @(Result.jit-def &result)
     "classify(5) == 5 + magic(7) == 12  (switch default + global load)"))

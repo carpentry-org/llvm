@@ -8,24 +8,51 @@
 
 (defn cstr [s] (String.cstr s))
 
-(deftype Adv [pre-alloca Bool pass-err String post-alloca Bool
-              vec-err String vec-has Bool
-              attr-has Bool
-              dbg-err String dbg-has Bool
-              parse-ok Bool parse-has Bool bc-rc Int])
+(deftype Adv
+  [pre-alloca Bool
+   pass-err String
+   post-alloca Bool
+   vec-err String
+   vec-has Bool
+   attr-has Bool
+   dbg-err String
+   dbg-has-subprogram Bool
+   dbg-has-file-scope Bool
+   dbg-instruction Bool
+   dbg-rejects-function Bool
+   dbg-has-location Bool
+   parse-ok Bool
+   parse-has Bool
+   bc-rc Int])
 
-(deftype PassR [pre Bool err String post Bool])
-(deftype VecR [err String has Bool])
-(deftype DbgR [err String has Bool])
-(deftype IoR [rc Int ok Bool has Bool])
+(deftype PassR [pre Bool
+                err String
+                post Bool])
+(deftype VecR [err String
+               has Bool])
+(deftype DbgR
+  [err String
+   has-subprogram Bool
+   has-file-scope Bool
+   instruction Bool
+   rejects-function Bool
+   has-location Bool])
+(deftype IoR [rc Int
+              ok Bool
+              has Bool])
 
 (defn host-target-machine []
   (do
     (ignore (initialize-native-target))
     (ignore (initialize-native-asm-printer))
     (let [triple (default-target-triple)]
-      (create-target-machine (target-from-triple (cstr &triple)) (cstr &triple)
-        (cstr &@"") (cstr &@"") codegen-level-default reloc-pic codemodel-default))))
+      (create-target-machine (target-from-triple (cstr &triple))
+                             (cstr &triple)
+                             (cstr &@"")
+                             (cstr &@"")
+                             codegen-level-default
+                             reloc-pic
+                             codemodel-default))))
 
 ; --- passes: a dead alloca should be gone after default<O2> ---
 (defn part-passes []
@@ -58,12 +85,18 @@
            builder (builder-create ctx)
            mod (module-create (cstr &@"vec") ctx)
            v4 (vector-type (int32-type ctx) 4)
-           params [(vector-type (int32-type ctx) 4) (vector-type (int32-type ctx) 4)]
+           params [(vector-type (int32-type ctx) 4)
+                   (vector-type (int32-type ctx) 4)]
            fnty (function-type v4 &params false)
            func (add-function mod (cstr &@"vadd") fnty)
            entry (append-block ctx func (cstr &@"entry"))]
     (position-at-end builder entry)
-    (ignore (build-ret builder (build-add builder (get-param func 0) (get-param func 1) (cstr &@"s"))))
+    (ignore
+      (build-ret builder
+                 (build-add builder
+                            (get-param func 0)
+                            (get-param func 1)
+                            (cstr &@"s"))))
     (let-do [err (verify-module mod)
              has (String.contains-string? &(print-module mod) &@"<4 x i32>")]
       (builder-dispose builder)
@@ -77,8 +110,11 @@
            params [(int32-type ctx)]
            fnty (function-type (int32-type ctx) &params false)
            func (add-function mod (cstr &@"g") fnty)]
-    (add-attribute func attr-function-index
-      (create-enum-attribute ctx (enum-attribute-kind (cstr &@"noinline")) 0l))
+    (add-attribute func
+                   attr-function-index
+                   (create-enum-attribute ctx
+                                          (enum-attribute-kind (cstr &@"noinline"))
+                                          0l))
     (let-do [has (String.contains-string? &(print-module mod) &@"noinline")]
       (context-dispose ctx)
       has)))
@@ -95,23 +131,43 @@
            dib (di-builder-create mod)
            file (di-file dib (cstr &@"test.c") (cstr &@"/tmp"))
            cu (di-compile-unit dib file (cstr &@"carp-llvm"))
-           subty (di-subroutine-type dib file
-                   &[(di-basic-type dib (cstr &@"int") 32l dwarf-signed)
-                     (di-basic-type dib (cstr &@"int") 32l dwarf-signed)])
-           sp (di-function dib cu (cstr &@"dbgfn") file 1 subty)]
+           subty (di-subroutine-type dib
+                                     file
+                                     &[(di-basic-type dib
+                                                      (cstr &@"int")
+                                                      32l
+                                                      dwarf-signed)
+                                       (di-basic-type dib
+                                                      (cstr &@"int")
+                                                      32l
+                                                      dwarf-signed)])
+           sp (di-function dib cu (cstr &@"dbgfn") file 1 subty)
+           file-scope (di-lexical-block-file dib sp file 0)
+           location (debug-location ctx 2 3 file-scope)]
     (set-subprogram func sp)
-    (add-module-flag mod behavior-warning (cstr &@"Debug Info Version")
-      (value-as-metadata (const-int (int32-type ctx) 3l 0)))
+    (add-module-flag mod
+                     behavior-warning
+                     (cstr &@"Debug Info Version")
+                     (value-as-metadata (const-int (int32-type ctx) 3l 0)))
     (position-at-end builder entry)
-    (set-debug-location builder (debug-location ctx 2 3 sp))
-    (ignore (build-ret builder (get-param func 0)))
-    (di-finalize dib)
-    (let-do [err (verify-module mod)
-             has (String.contains-string? &(print-module mod) &@"DISubprogram")]
-      (di-builder-dispose dib)
-      (builder-dispose builder)
-      (context-dispose ctx)
-      (DbgR.init err has))))
+    (set-debug-location builder location)
+    (clear-debug-location builder)
+    (let-do [ret (build-ret builder (get-param func 0))]
+      (set-instruction-debug-location ret location)
+      (di-finalize dib)
+      (let-do [err (verify-module mod)
+               ir (print-module mod)
+               result (DbgR.init err
+                                 (String.contains-string? &ir &@"DISubprogram")
+                                 (String.contains-string? &ir
+                                                          &@"DILexicalBlockFile")
+                                 (instruction? ret)
+                                 (not (instruction? func))
+                                 (String.contains-string? &ir &@"!dbg"))]
+        (di-builder-dispose dib)
+        (builder-dispose builder)
+        (context-dispose ctx)
+        result))))
 
 ; --- I/O: write .ll and .bc, parse the .ll back into a fresh context ---
 (defn part-io []
@@ -130,7 +186,9 @@
              buf (memory-buffer-of-file (cstr &@"out/io.ll"))
              parsed (parse-ir ctx2 buf)
              ok (not (module-null? parsed))
-             has (if ok (String.contains-string? &(print-module parsed) &@"io_fn") false)]
+             has (if ok
+               (String.contains-string? &(print-module parsed) &@"io_fn")
+               false)]
       (unless (module-null? parsed) (module-dispose parsed))
       (context-dispose ctx2)
       (builder-dispose builder)
@@ -142,34 +200,55 @@
         v (part-vectors)
         d (part-debug)
         io (part-io)]
-    (Adv.init @(PassR.pre &p) @(PassR.err &p) @(PassR.post &p)
-              @(VecR.err &v) @(VecR.has &v)
+    (Adv.init @(PassR.pre &p)
+              @(PassR.err &p)
+              @(PassR.post &p)
+              @(VecR.err &v)
+              @(VecR.has &v)
               (part-attributes)
-              @(DbgR.err &d) @(DbgR.has &d)
-              @(IoR.ok &io) @(IoR.has &io) @(IoR.rc &io))))
+              @(DbgR.err &d)
+              @(DbgR.has-subprogram &d)
+              @(DbgR.has-file-scope &d)
+              @(DbgR.instruction &d)
+              @(DbgR.rejects-function &d)
+              @(DbgR.has-location &d)
+              @(IoR.ok &io)
+              @(IoR.has &io)
+              @(IoR.rc &io))))
 
 (def adv (lower-advanced))
 
 (deftest test
-  (assert-true test @(Adv.pre-alloca &adv)
-    "pre-optimization IR has an alloca")
-  (assert-true test (String.empty? (Adv.pass-err &adv))
+  (assert-true test @(Adv.pre-alloca &adv) "pre-optimization IR has an alloca")
+  (assert-true test
+    (String.empty? (Adv.pass-err &adv))
     "run-passes default<O2> succeeded")
-  (assert-false test @(Adv.post-alloca &adv)
+  (assert-false test
+    @(Adv.post-alloca &adv)
     "default<O2> eliminated the dead alloca")
-  (assert-true test (String.empty? (Adv.vec-err &adv))
-    "vector module verifies")
-  (assert-true test @(Adv.vec-has &adv)
-    "IR contains a <4 x i32> vector type")
-  (assert-true test @(Adv.attr-has &adv)
+  (assert-true test (String.empty? (Adv.vec-err &adv)) "vector module verifies")
+  (assert-true test @(Adv.vec-has &adv) "IR contains a <4 x i32> vector type")
+  (assert-true test
+    @(Adv.attr-has &adv)
     "function carries the noinline attribute")
-  (assert-true test (String.empty? (Adv.dbg-err &adv))
+  (assert-true test
+    (String.empty? (Adv.dbg-err &adv))
     "module with debug info verifies")
-  (assert-true test @(Adv.dbg-has &adv)
-    "IR contains a DISubprogram")
-  (assert-equal test 0 @(Adv.bc-rc &adv)
-    "bitcode written successfully")
-  (assert-true test @(Adv.parse-ok &adv)
-    "written .ll parses back into a module")
-  (assert-true test @(Adv.parse-has &adv)
+  (assert-true test @(Adv.dbg-has-subprogram &adv) "IR contains a DISubprogram")
+  (assert-true test
+    @(Adv.dbg-has-file-scope &adv)
+    "IR contains a file-specific lexical scope")
+  (assert-true test
+    @(Adv.dbg-instruction &adv)
+    "instruction? accepts an instruction")
+  (assert-true test
+    @(Adv.dbg-rejects-function &adv)
+    "instruction? rejects a function")
+  (assert-true test
+    @(Adv.dbg-has-location &adv)
+    "a debug location can be attached directly to an instruction")
+  (assert-equal test 0 @(Adv.bc-rc &adv) "bitcode written successfully")
+  (assert-true test @(Adv.parse-ok &adv) "written .ll parses back into a module")
+  (assert-true test
+    @(Adv.parse-has &adv)
     "round-tripped module still declares io_fn"))

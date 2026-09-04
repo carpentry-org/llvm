@@ -1,0 +1,24 @@
+(load "llvm.carp")
+(LLVM.setup)
+
+(Project.config "title" "llvm")
+(Project.config "docs-directory" "./docs/")
+(Project.config "docs-logo" "")
+(Project.config "docs-url" "https://github.com/carpentry-org/llvm")
+(Project.config "docs-styling" "../style.css")
+(Project.config "docs-prelude" "Thin Carp bindings over the LLVM-C API.
+
+Call `LLVM.setup` after loading the package. `LLVM` contains the raw handle and
+function bindings; `LLVMx` contains small lifecycle helpers. LLVM owns most
+handles transitively, so read the ownership notes in the project README before
+disposing contexts, modules, execution engines, or ORC resources.
+
+### Quick start
+```
+(load \"git@github.com:carpentry-org/llvm@0.1.0\")
+(LLVM.setup)
+```")
+
+(save-docs LLVM LLVMx)
+
+(defn main [] (System.system "cp ./docs/llvm_index.html ./docs/index.html"))
