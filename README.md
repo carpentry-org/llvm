@@ -11,8 +11,10 @@ Two layers, following the `lua`/`luax` precedent:
 
 ## Prerequisites
 
-LLVM must be installed with its development headers, `llvm-config`, and a
-linkable `libLLVM`. On macOS via Homebrew:
+LLVM 21 or later must be installed with its development headers,
+`llvm-config`, and a linkable `libLLVM`. The ORC bindings use
+`LLVMOrcCreateNewThreadSafeContextFromLLVMContext`, which LLVM 21 introduced.
+On macOS via Homebrew:
 
 ```
 brew install llvm
@@ -23,11 +25,12 @@ brew install llvm
 elsewhere:
 
 ```
-(LLVM.setup "/usr/lib/llvm-18")
+(LLVM.setup "/usr/lib/llvm-21")
 ```
 
-Version 0.1.0 is tested against LLVM 22.1.8 on macOS. CI is configured to also
-exercise the distribution LLVM package on Ubuntu.
+Distribution packages can be older than 21 (Ubuntu 24.04 ships 18); the
+[apt.llvm.org](https://apt.llvm.org) packages are current. CI tests LLVM 21 from
+apt.llvm.org on Ubuntu and Homebrew's current LLVM on macOS.
 
 ## Usage
 

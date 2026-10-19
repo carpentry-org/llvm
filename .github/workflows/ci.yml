@@ -21,9 +21,17 @@ jobs:
 
       - name: Install LLVM (Ubuntu)
         if: runner.os == 'Linux'
+        # the ORC bindings need LLVM 21+, newer than the distribution package
         run: |
+          set -euo pipefail
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          codename=$(lsb_release -cs)
+          echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          sudo apt-get install -y llvm-dev
+          sudo apt-get install -y llvm-21-dev
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
 
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
