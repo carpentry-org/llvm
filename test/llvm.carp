@@ -46,6 +46,22 @@
 
 (def built (build-add-module))
 
+; Emit an empty `void nop()` into a fresh module and return its IR.
+(defn emit-nop [ctx builder]
+  (let-do [mod (module-create (String.cstr &@"scoped") ctx)
+           fnty (function-type (void-type ctx) &[] false)
+           func (add-function mod (String.cstr &@"nop") fnty)]
+    (position-at-end builder (append-block ctx func (String.cstr &@"entry")))
+    (ignore (build-ret-void builder))
+    (let-do [ir (print-module mod)] (module-dispose mod) ir)))
+
+; Run emit-nop inside the LLVMx lifecycle macros.
+(defn build-scoped-module []
+  (let-do [ir @""]
+    (LLVMx.with-context ctx
+                        (LLVMx.with-builder b ctx (set! ir (emit-nop ctx b))))
+    ir))
+
 (deftest test
   (assert-true test
     (String.empty? (Built.verify &built))
@@ -56,4 +72,7 @@
   (assert-equal test
     42
     @(Built.jit &built)
-    "JIT-compiled add(20, 22) returns 42"))
+    "JIT-compiled add(20, 22) returns 42")
+  (assert-true test
+    (String.contains-string? &(build-scoped-module) &@"define void @nop")
+    "with-context and with-builder run their body"))
