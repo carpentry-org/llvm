@@ -1024,15 +1024,13 @@ instruction value.")
   (doc with-context
     "Bind `name` to a fresh context, run `body`, then dispose it.")
   (defmacro with-context [name :rest body]
-    (eval
-      `(let-do [%name (LLVM.context-create)]
-        %(cons 'do body)
-        (LLVM.context-dispose %name))))
+    `(let-do [%name (LLVM.context-create)]
+      %(cons 'do body)
+      (LLVM.context-dispose %name)))
 
   (doc with-builder
     "Bind `name` to a builder on `ctx`, run `body`, then dispose it.")
   (defmacro with-builder [name ctx :rest body]
-    (eval
-      `(let-do [%name (LLVM.builder-create %ctx)]
-        %(cons 'do body)
-        (LLVM.builder-dispose %name)))))
+    `(let-do [%name (LLVM.builder-create %ctx)]
+      %(cons 'do body)
+      (LLVM.builder-dispose %name))))
