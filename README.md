@@ -35,7 +35,7 @@ apt.llvm.org on Ubuntu and Homebrew's current LLVM on macOS.
 ## Usage
 
 ```clojure
-(load "git@github.com:carpentry-org/llvm@0.1.0")
+(load "git@github.com:carpentry-org/llvm@0.1.1")
 (LLVM.setup)
 
 (use LLVM)

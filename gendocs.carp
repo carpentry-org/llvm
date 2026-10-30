@@ -15,7 +15,7 @@ disposing contexts, modules, execution engines, or ORC resources.
 
 ### Quick start
 ```
-(load \"git@github.com:carpentry-org/llvm@0.1.0\")
+(load \"git@github.com:carpentry-org/llvm@0.1.1\")
 (LLVM.setup)
 ```")
 
